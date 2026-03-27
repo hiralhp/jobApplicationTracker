@@ -626,17 +626,29 @@ _COMPANY_SUBJECT_PATTERNS = [
     r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received|thank you)",
     # "… | Company" at subject end
     r"[|]\s*([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*$",
-    # "Company Talent Acquisition" — footer signature pattern
-    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s+Talent\s+Acquisition\b",
 ]
+
+# Signature-line pattern handled separately (allows "The ..." company names)
+_TALENT_ACQUISITION_PAT = re.compile(
+    r"^((?:The\s+)?[A-Z][A-Za-z0-9 &.,'\-]{1,60}?)\s+Talent\s+Acquisition\b"
+)
 
 def _extract_company_from_subject(subject):
     """Parse a company name from an email line. Returns None if uncertain."""
+    # Check signature line first (allows leading "The")
+    m = _TALENT_ACQUISITION_PAT.match(subject)
+    if m:
+        name = m.group(1).strip().rstrip(".,- ")
+        if len(name) > 2:
+            return name
     for pat in _COMPANY_SUBJECT_PATTERNS:
         m = re.search(pat, subject)
         if m:
             name = m.group(1).strip().rstrip(".,- ")
             first = name.split()[0].lower()
+            # Allow "The ProperNoun" (e.g. "The New York Times", "The Trade Desk")
+            if first == "the" and len(name.split()) >= 2 and name.split()[1][0].isupper():
+                return name
             if len(name) > 2 and first not in _SKIP_NAMES and first not in _JOB_LEVEL_WORDS:
                 return name
     return None
@@ -767,13 +779,23 @@ def run_gmail_sync(days=90):
             # Try to extract company name for untracked companies
             extracted = _extract_company_from_subject(subject)
 
-            # Scan first 10 body lines when subject is generic (e.g. "Application Confirmation")
+            # Scan first 15 body lines when subject is generic
             if not extracted and body:
-                for line in body.splitlines()[:10]:
+                for line in body.splitlines()[:15]:
                     line = line.strip()
                     if len(line) > 5:
                         extracted = _extract_company_from_subject(line)
                         if extracted:
+                            break
+
+            # Full-body scan for "Company Talent Acquisition" signature (can appear anywhere)
+            if not extracted and body:
+                for line in body.splitlines():
+                    m = _TALENT_ACQUISITION_PAT.match(line.strip())
+                    if m:
+                        name = m.group(1).strip().rstrip(".,- ")
+                        if len(name) > 2:
+                            extracted = name
                             break
 
             # Fallback: infer from sender domain (e.g. no-reply@stripe.com → "Stripe")
