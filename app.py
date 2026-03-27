@@ -1356,80 +1356,82 @@ def render_setup_tab():
     st.subheader("Setup Guide")
     st.markdown(
         '<p style="color:#6b7280;font-size:0.9rem;margin-bottom:1.5rem">'
-        "Get your own copy of this app running in a few steps — no coding required."
+        "Get the app running on your own computer in a few steps — everything stays local and private."
         "</p>",
         unsafe_allow_html=True,
     )
 
-    with st.expander("① Get the code", expanded=True):
+    with st.expander("① Download the code", expanded=True):
         st.markdown("""
 Go to **[github.com/hiralhp/jobApplicationTracker](https://github.com/hiralhp/jobApplicationTracker)**
-and click **Fork** (top right) to copy the repo to your own GitHub account.
+and click **Code → Download ZIP**. Unzip it anywhere on your computer.
+
+Or if you have Git installed:
+```powershell
+git clone https://github.com/hiralhp/jobApplicationTracker.git
+```
         """)
 
-    with st.expander("② Deploy on Streamlit Community Cloud", expanded=True):
+    with st.expander("② Install Python", expanded=True):
         st.markdown("""
-1. Go to **[share.streamlit.io](https://share.streamlit.io)** and sign in with your GitHub account
-2. Click **Create app**
-3. Select your forked repo, set branch to `main`, and main file path to `app.py`
-4. Click **Deploy**
+Download and install **Python 3.9+** from **[python.org](https://www.python.org/downloads/)**.
 
-Your app will be live at a URL like `https://yourname-jobapplicationtracker.streamlit.app` in about a minute.
-The app starts fresh with an empty database — your data is separate from everyone else's.
+During installation on Windows, check **"Add Python to PATH"**.
         """)
 
-    with st.expander("③ Set up Gmail sync", expanded=False):
+    with st.expander("③ Install dependencies & run the app", expanded=True):
         st.markdown("""
-Gmail sync requires a one-time setup through Google Cloud. This is free.
+Open a terminal in the folder where you downloaded the app:
+- **Windows** → open **PowerShell**, then type `cd` followed by the folder path
+- **Mac** → open **Terminal**, then type `cd` followed by the folder path
 
-**Create credentials:**
-1. Go to **[Google Cloud Console](https://console.cloud.google.com/)** and create a new project
-2. Navigate to **APIs & Services → Library**, search for **Gmail API**, click **Enable**
-3. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-4. Set **Application type** to **Desktop app**, click **Create**
-5. Click **Download JSON** — this is your `credentials.json` file
-
-**Configure the consent screen:**
-1. Go to **APIs & Services → OAuth consent screen**, choose **External**, click **Create**
-2. Fill in an app name (e.g. *Job Tracker*) and your email — leave everything else blank
-3. On the **Test users** page, add your Gmail address, then save
-4. You don't need to publish — testing mode is fine for personal use
-
-**Authorize the app (run locally once):**
-
-Gmail OAuth needs a browser popup which only works when running locally, not on the cloud.
-You'll need to do this one-time step on your own computer:
-
-- **Windows** → open **PowerShell**
-- **Mac** → open **Terminal** (Applications → Utilities → Terminal)
-
-Install Python from [python.org](https://www.python.org/downloads/) if you don't have it, then run:
+Install dependencies:
 ```powershell
 pip install streamlit pandas google-auth-oauthlib google-auth-httplib2 google-api-python-client
 ```
 
-Download your forked repo, place `credentials.json` in the folder, then run:
+Start the app:
 ```powershell
 streamlit run app.py
 ```
 
-Open the **Gmail Sync** tab and click **Sync Gmail** — a browser window will pop up to authorize.
-After approving, a `token.json` file is created. **Keep this file private — don't share it.**
-
-> Gmail sync will then work on your local copy. For the cloud version, Gmail sync is not available
-> unless you add `token.json` as a Streamlit secret (advanced).
+A browser window will open automatically. Your data is stored locally in `job_tracker.db` — nobody else can see it.
         """)
 
-    with st.expander("④ Keeping your data private", expanded=False):
+    with st.expander("④ Set up Gmail sync (optional)", expanded=False):
         st.markdown("""
-Your app instance has its own separate database — nobody else can see your companies or job applications.
+Gmail sync is free to set up through Google Cloud.
 
-Never commit these files to GitHub if you clone/fork locally:
+**Step 1 — Enable the Gmail API:**
+1. Go to **[Google Cloud Console](https://console.cloud.google.com/)** and create a new project
+2. Go to **APIs & Services → Library**, search **Gmail API**, click **Enable**
+
+**Step 2 — Create credentials:**
+1. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+2. Set **Application type** to **Desktop app**, click **Create**
+3. Click **Download JSON** and save it as **`credentials.json`** in the app folder
+
+**Step 3 — Configure the consent screen:**
+1. Go to **APIs & Services → OAuth consent screen**, choose **External**, click **Create**
+2. Enter an app name (e.g. *Job Tracker*) and your email — leave everything else blank
+3. On the **Test users** page add your Gmail address, then save
+4. No need to publish — testing mode works fine for personal use
+
+**Step 4 — Authorize:**
+1. Restart the app (`streamlit run app.py`)
+2. Open the **Gmail Sync** tab and click **Sync Gmail**
+3. A browser window will open — sign in and approve access
+4. Done! A `token.json` file is saved so you won't need to authorize again
+        """)
+
+    with st.expander("⑤ Keeping your data private", expanded=False):
+        st.markdown("""
+These files live only on your computer and should never be shared:
 - `credentials.json` — your Google OAuth credentials
 - `token.json` — your Gmail auth token
 - `job_tracker.db` — your personal data
 
-These are already listed in the `.gitignore` file included in the repo.
+If you ever push code changes back to GitHub, these are already listed in `.gitignore` so they won't be included.
         """)
 
 
