@@ -310,6 +310,8 @@ _CONFIRM_SUBJ_KWS = [
     "thanks for applying",
     "thank you for your application",
     "thanks for your application",
+    "thank you for your interest",
+    "thanks for your interest",
     "application received",
     "application confirmation",
     "we received your application",
@@ -321,6 +323,7 @@ _CONFIRM_BODY_KWS = [
     "received your application",
     "we received your application",
     "have received your application",
+    "we have received your application",
     "thank you for applying",
     "thanks for applying",
     "application has been received",
@@ -333,6 +336,8 @@ _GMAIL_SUBJECT_TERMS = [
     'subject:("thanks for applying")',
     'subject:("thank you for your application")',
     'subject:("thanks for your application")',
+    'subject:("thank you for your interest")',
+    'subject:("thanks for your interest")',
     'subject:("application received")',
     'subject:("application confirmation")',
     'subject:("we received your application")',
@@ -351,6 +356,23 @@ def days_ago(last_scraped):
     if not last_scraped:
         return None
     return (date.today() - parse_date(last_scraped)).days
+
+
+def _unwrap_forwarded(subject, sender, body):
+    """If this is a forwarded email, return the original subject, sender, and body."""
+    if not re.match(r'^fwd?:\s*', subject, re.IGNORECASE):
+        return subject, sender, body
+    # Extract original headers from the forwarded block
+    fwd_match = re.search(r'-{3,}\s*Forwarded message\s*-{3,}', body, re.IGNORECASE)
+    if not fwd_match:
+        return re.sub(r'^fwd?:\s*', '', subject, flags=re.IGNORECASE), sender, body
+    fwd_block = body[fwd_match.start():]
+    orig_from    = re.search(r'From:\s*(.+)', fwd_block)
+    orig_subject = re.search(r'Subject:\s*(.+)', fwd_block)
+    orig_body    = body[fwd_match.end():]
+    eff_sender  = orig_from.group(1).strip()    if orig_from    else sender
+    eff_subject = orig_subject.group(1).strip() if orig_subject else re.sub(r'^fwd?:\s*', '', subject, flags=re.IGNORECASE)
+    return eff_subject, eff_sender, orig_body
 
 
 def _favicon_domain(company_name, careers_url):
@@ -616,6 +638,9 @@ def run_gmail_sync(days=90):
         subject = hdrs.get("Subject", "")
         sender  = hdrs.get("From", "")
         body    = _extract_email_body(msg["payload"])
+
+        # Unwrap forwarded emails so we match on the original sender/subject
+        subject, sender, body = _unwrap_forwarded(subject, sender, body)
 
         # Only surface application-received emails
         if not _is_application_confirmation(subject, body):
@@ -945,7 +970,7 @@ def render_gmail_tab():
 
     # ── Controls ──
     c1, c2, c3 = st.columns([1.3, 1.0, 1])
-    sync_days = c3.number_input("Days to scan", min_value=1, max_value=365, value=90, step=1, key="gmail_days")
+    sync_days = c3.number_input("Days to scan", min_value=1, value=90, step=1, key="gmail_days")
     if c1.button("🔄  Sync Gmail", type="primary"):
         with st.spinner("Syncing…  (a browser window may open for first-time authorization)"):
             log = run_gmail_sync(days=sync_days)
@@ -1383,6 +1408,7 @@ Gmail sync is free to set up through Google Cloud.
 3. Click **Save and Continue**
 4. On the **Scopes** page click **Save and Continue** without adding anything
 5. On the **Test users** page click **Add Users**, enter your Gmail address, click **Add**, then **Save and Continue**
+   - If you don't see a Test users page during setup, go back to **OAuth consent screen → Audience** and add yourself there
 6. No need to publish — testing mode works fine for personal use
 
 **Step 4 — Authorize:**
