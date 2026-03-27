@@ -497,6 +497,8 @@ _REJECT_SIGNALS = [
     "regret to inform you",
     "regret to let you know",
     "decided not to move forward",
+    "decision to not move forward",
+    "decision not to move forward",
     "not moving forward with your",
     "will not be moving forward",
     "decided to proceed with other candidates",
@@ -565,12 +567,10 @@ def _match_company(sender, subject, companies, body=""):
         if re.search(r'\b' + re.escape(name_l) + r'\b', subj_l):
             return row[1]
 
-    # For ATS senders: fall back to searching company name in email body
+    # For ATS senders: fall back to searching company name in email body (case-sensitive)
     if is_ats and body:
-        body_l = body.lower()
         for row in companies:
-            name_l = row[1].lower()
-            if re.search(r'\b' + re.escape(name_l) + r'\b', body_l):
+            if re.search(r'\b' + re.escape(row[1]) + r'\b', body):
                 return row[1]
 
     # Sender domain → company name slug fallback (use second-to-last part, e.g. "anthropic" from "mail.anthropic.com")
