@@ -207,6 +207,17 @@ def init_db():
             """)
             conn.execute("INSERT INTO companies SELECT * FROM companies_old")
             conn.execute("DROP TABLE companies_old")
+        # applications log — one row per application (multiple per company)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS applications (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_name TEXT    NOT NULL,
+                job_title    TEXT,
+                applied_date DATE,
+                email_subject TEXT,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # job_postings table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS job_postings (
@@ -237,6 +248,21 @@ def add_company(name, last_applied=None, notes="", careers_url="", recruiting_em
             (name, last_applied, notes, careers_url, recruiting_email),
         )
         conn.commit()
+
+
+def log_application(company_name, job_title, applied_date, email_subject=""):
+    """Insert one row into the applications log (no-op if duplicate within same day)."""
+    with get_conn() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM applications WHERE LOWER(company_name)=LOWER(?) AND applied_date=?",
+            (company_name, applied_date),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO applications (company_name, job_title, applied_date, email_subject) VALUES (?, ?, ?, ?)",
+                (company_name, job_title or None, applied_date, email_subject or None),
+            )
+            conn.commit()
 
 
 def mark_scraped(company_id):
@@ -610,6 +636,30 @@ def _extract_company_from_subject(subject):
     return None
 
 
+_JOB_TITLE_PATTERNS = [
+    # "applying to the [Title] position/role"
+    r"appl(?:ying|ied|ication)\s+(?:to\s+)?(?:for\s+)?the\s+(.+?)\s+(?:position|role|opening|opportunity)\b",
+    # "for the [Title] position/role"
+    r"\bfor\s+the\s+(.+?)\s+(?:position|role|opening)\b",
+    # "interest in the [Title] role"
+    r"\binterest\s+in\s+the\s+(.+?)\s+(?:position|role|opening)\b",
+]
+
+def _extract_job_title(subject, body=""):
+    """Try to extract a job title from subject then first 15 body lines."""
+    for text in [subject] + (body.splitlines()[:15] if body else []):
+        text = text.strip()
+        if not text:
+            continue
+        for pat in _JOB_TITLE_PATTERNS:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                title = m.group(1).strip().rstrip(".,- ")
+                if 3 < len(title) < 120:
+                    return title
+    return None
+
+
 def _should_update(current, new):
     if current == new or current == "Rejected":
         return False
@@ -702,6 +752,7 @@ def run_gmail_sync(days=90):
                     "type": "pending", "company": company, "subject": subject,
                     "sender": sender, "body": body, "last_checked": last_checked,
                     "last_applied": last_applied,
+                    "job_title": _extract_job_title(subject, body),
                     "email_date": email_date.isoformat(), "new_age": new_age,
                     "msg_id": ref["id"],
                     "thread_id": msg.get("threadId"),
@@ -735,6 +786,7 @@ def run_gmail_sync(days=90):
                     best_new[key] = {
                         "type": "new", "company": extracted, "subject": subject,
                         "sender": sender, "body": body,
+                        "job_title": _extract_job_title(subject, body),
                         "email_date": email_date.isoformat(), "new_age": new_age,
                         "msg_id": ref["id"], "thread_id": msg.get("threadId"),
                     }
@@ -1162,6 +1214,7 @@ def render_gmail_tab():
                 if row[1].button("Update Tracker", key=f"{key_prefix}_apply_{i}", type="primary"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
+                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
@@ -1169,6 +1222,7 @@ def render_gmail_tab():
                 if row[2].button("Update & 🗑", key=f"{key_prefix}_apply_del_{i}"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
+                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     try:
                         _trash_thread(e)
                     except Exception as ex:
@@ -1289,6 +1343,7 @@ def render_gmail_tab():
                 )
                 if row[1].button("Add to Tracker", key=f"new_apply_{i}", type="primary"):
                     add_company(e["company"], e["email_date"])
+                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
@@ -1296,6 +1351,7 @@ def render_gmail_tab():
                     st.rerun()
                 if row[2].button("Add & 🗑", key=f"new_apply_del_{i}"):
                     add_company(e["company"], e["email_date"])
+                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
                     try:
                         _trash_new(e)
