@@ -1400,94 +1400,81 @@ def render_setup_tab():
     st.subheader("Setup Guide")
     st.markdown(
         '<p style="color:#6b7280;font-size:0.9rem;margin-bottom:1.5rem">'
-        "Follow these steps to get the app running with Gmail sync on your own account."
+        "Get your own copy of this app running in a few steps — no coding required."
         "</p>",
         unsafe_allow_html=True,
     )
 
-    with st.expander("① Install Python & dependencies", expanded=False):
+    with st.expander("① Get the code", expanded=True):
         st.markdown("""
-Make sure you have **Python 3.9+** installed from [python.org](https://www.python.org/downloads/).
+Go to **[github.com/hiralhp/jobApplicationTracker](https://github.com/hiralhp/jobApplicationTracker)**
+and click **Fork** (top right) to copy the repo to your own GitHub account.
+        """)
 
-Open a terminal for your OS:
-- **Windows** → search for **PowerShell** in the Start menu
+    with st.expander("② Deploy on Streamlit Community Cloud", expanded=True):
+        st.markdown("""
+1. Go to **[share.streamlit.io](https://share.streamlit.io)** and sign in with your GitHub account
+2. Click **Create app**
+3. Select your forked repo, set branch to `main`, and main file path to `app.py`
+4. Click **Deploy**
+
+Your app will be live at a URL like `https://yourname-jobapplicationtracker.streamlit.app` in about a minute.
+The app starts fresh with an empty database — your data is separate from everyone else's.
+        """)
+
+    with st.expander("③ Set up Gmail sync", expanded=False):
+        st.markdown("""
+Gmail sync requires a one-time setup through Google Cloud. This is free.
+
+**Create credentials:**
+1. Go to **[Google Cloud Console](https://console.cloud.google.com/)** and create a new project
+2. Navigate to **APIs & Services → Library**, search for **Gmail API**, click **Enable**
+3. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+4. Set **Application type** to **Desktop app**, click **Create**
+5. Click **Download JSON** — this is your `credentials.json` file
+
+**Configure the consent screen:**
+1. Go to **APIs & Services → OAuth consent screen**, choose **External**, click **Create**
+2. Fill in an app name (e.g. *Job Tracker*) and your email — leave everything else blank
+3. On the **Test users** page, add your Gmail address, then save
+4. You don't need to publish — testing mode is fine for personal use
+
+**Authorize the app (run locally once):**
+
+Gmail OAuth needs a browser popup which only works when running locally, not on the cloud.
+You'll need to do this one-time step on your own computer:
+
+- **Windows** → open **PowerShell**
 - **Mac** → open **Terminal** (Applications → Utilities → Terminal)
-- **Linux** → open your system **Terminal**
 
-Navigate to the folder where you saved `app.py`:
-```powershell
-cd path/to/your/folder
-```
-
-Install dependencies:
+Install Python from [python.org](https://www.python.org/downloads/) if you don't have it, then run:
 ```powershell
 pip install streamlit pandas google-auth-oauthlib google-auth-httplib2 google-api-python-client
 ```
 
-Start the app:
+Download your forked repo, place `credentials.json` in the folder, then run:
 ```powershell
 streamlit run app.py
 ```
 
-A browser window will open automatically at `http://localhost:8501`.
+Open the **Gmail Sync** tab and click **Sync Gmail** — a browser window will pop up to authorize.
+After approving, a `token.json` file is created. **Keep this file private — don't share it.**
+
+> Gmail sync will then work on your local copy. For the cloud version, Gmail sync is not available
+> unless you add `token.json` as a Streamlit secret (advanced).
         """)
 
-    with st.expander("② Enable the Gmail API & create credentials", expanded=True):
+    with st.expander("④ Keeping your data private", expanded=False):
         st.markdown("""
-1. Go to **[Google Cloud Console](https://console.cloud.google.com/)**
-2. Create a new project (or select an existing one)
-3. Navigate to **APIs & Services → Library**, search for **Gmail API**, and click **Enable**
-4. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-5. Set **Application type** to **Desktop app**, give it any name, click **Create**
-6. Click **Download JSON** and save the file as **`credentials.json`** in the same folder as `app.py`
+Your app instance has its own separate database — nobody else can see your companies or job applications.
+
+Never commit these files to GitHub if you clone/fork locally:
+- `credentials.json` — your Google OAuth credentials
+- `token.json` — your Gmail auth token
+- `job_tracker.db` — your personal data
+
+These are already listed in the `.gitignore` file included in the repo.
         """)
-
-    with st.expander("③ Configure the OAuth consent screen", expanded=False):
-        st.markdown("""
-1. In Google Cloud Console go to **APIs & Services → OAuth consent screen**
-2. Choose **External** and click **Create**
-3. Fill in an app name (e.g. *Job Tracker*) and your email address — the rest can be left blank
-4. On the **Scopes** page click **Save and Continue** without adding any scopes
-5. On the **Test users** page add the Gmail address you want to sync, then click **Save**
-6. You don't need to publish the app — keeping it in testing mode is fine for personal use
-        """)
-
-    with st.expander("④ Authorize on first sync", expanded=False):
-        st.markdown("""
-1. Open the **Gmail Sync** tab and click **Sync Gmail**
-2. A browser window will open asking you to sign in to Google and grant access
-3. After approving, a `token.json` file is saved locally — you won't need to authorize again
-4. If you ever want to disconnect, click **Disconnect Gmail** in the sync tab
-
-> **Note:** Keep `credentials.json` and `token.json` out of any public repository.
-> Add them to `.gitignore` if you're using Git.
-        """)
-
-    with st.expander("⑤ Deploy to Streamlit Community Cloud (optional)", expanded=False):
-        st.markdown("""
-1. Push your code to a **public GitHub repository** — make sure `credentials.json` and `token.json` are in `.gitignore`
-2. Go to **[share.streamlit.io](https://share.streamlit.io)** and sign in with GitHub
-3. Click **New app**, select your repo and set the main file to `app.py`
-4. Under **Advanced settings → Secrets**, add your credentials as a secret if needed
-5. Click **Deploy** — your app gets a public URL like `https://yourname-jobtracker.streamlit.app`
-
-> **Note for Community Cloud:** Gmail OAuth requires a browser redirect, which doesn't work on a server.
-> For cloud deployments, each user should run the app locally to authorize Gmail, then upload their `token.json` as a Streamlit secret.
-        """)
-
-    with st.expander("⑥ Gitignore template", expanded=False):
-        st.code("""# Secrets — never commit these
-credentials.json
-token.json
-
-# Database — contains your personal data
-job_tracker.db
-
-# Python
-__pycache__/
-*.pyc
-.env
-""", language="gitignore")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
