@@ -1025,7 +1025,7 @@ def render_gmail_tab():
 
     errors  = [e for e in log if e["type"] == "error"]
     infos   = [e for e in log if e["type"] == "info"]
-    items   = [e for e in log if e["type"] == "pending"]
+    items   = [e for e in log if e["type"] in ("pending", "new")]
 
     st.markdown("---")
     st.markdown("**Sync Log**")
