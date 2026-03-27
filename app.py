@@ -1374,9 +1374,15 @@ git clone https://github.com/hiralhp/jobApplicationTracker.git
 
     with st.expander("② Install Python", expanded=True):
         st.markdown("""
-Download and install **Python 3.9+** from **[python.org](https://www.python.org/downloads/)**.
+First check if you already have Python installed. In your terminal run:
+```
+python --version
+```
+If you see `Python 3.9` or higher you're good — skip to the next step.
 
-During installation on Windows, check **"Add Python to PATH"**.
+If you get an error or an older version, download and install **Python 3.9+** from **[python.org](https://www.python.org/downloads/)**.
+
+> **Windows:** During installation check **"Add Python to PATH"** before clicking Install.
         """)
 
     with st.expander("③ Install dependencies & run the app", expanded=True):
