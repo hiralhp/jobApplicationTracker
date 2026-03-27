@@ -763,6 +763,10 @@ def run_gmail_sync(days=90):
                 update_company(company_row[0], company_row[4] or "",
                                company_row[5] or "", sender_addr_l)
 
+            # Auto-log job title to applications table (runs for every confirmation email found)
+            log_application(company, _extract_job_title(subject, body),
+                            email_date.isoformat(), subject)
+
             if key not in best:
                 last_checked  = company_row[2] if company_row else None
                 last_applied  = company_row[7] if company_row else None
@@ -770,7 +774,6 @@ def run_gmail_sync(days=90):
                     "type": "pending", "company": company, "subject": subject,
                     "sender": sender, "body": body, "last_checked": last_checked,
                     "last_applied": last_applied,
-                    "job_title": _extract_job_title(subject, body),
                     "email_date": email_date.isoformat(), "new_age": new_age,
                     "msg_id": ref["id"],
                     "thread_id": msg.get("threadId"),
@@ -814,7 +817,6 @@ def run_gmail_sync(days=90):
                     best_new[key] = {
                         "type": "new", "company": extracted, "subject": subject,
                         "sender": sender, "body": body,
-                        "job_title": _extract_job_title(subject, body),
                         "email_date": email_date.isoformat(), "new_age": new_age,
                         "msg_id": ref["id"], "thread_id": msg.get("threadId"),
                     }
@@ -1245,7 +1247,6 @@ def render_gmail_tab():
                 if row[1].button("Update Tracker", key=f"{key_prefix}_apply_{i}", type="primary"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
-                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
@@ -1253,7 +1254,6 @@ def render_gmail_tab():
                 if row[2].button("Update & 🗑", key=f"{key_prefix}_apply_del_{i}"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
-                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     try:
                         _trash_thread(e)
                     except Exception as ex:
@@ -1357,7 +1357,6 @@ def render_gmail_tab():
                 for bi in selected_ids:
                     be = next(e for j, e in action_vis if j == bi)
                     add_company(be["company"], be["email_date"])
-                    log_application(be["company"], be.get("job_title"), be["email_date"], be["subject"])
                     undo_data[bi] = {"company": be["company"]}
                     updated.add(bi)
                     st.session_state.pop(f"new_sel_{bi}", None)
@@ -1423,7 +1422,6 @@ def render_gmail_tab():
                 )
                 if row[2].button("Add to Tracker", key=f"new_apply_{i}", type="primary"):
                     add_company(e["company"], e["email_date"])
-                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
                     updated.add(i)
                     st.session_state.pop(f"new_sel_{i}", None)
@@ -1432,7 +1430,6 @@ def render_gmail_tab():
                     st.rerun()
                 if row[3].button("Add & 🗑", key=f"new_apply_del_{i}"):
                     add_company(e["company"], e["email_date"])
-                    log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
                     try:
                         _trash_new(e)
