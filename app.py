@@ -713,6 +713,7 @@ def run_gmail_sync(days=90):
                         "type": "new", "company": extracted, "subject": subject,
                         "sender": sender, "body": body,
                         "email_date": email_date.isoformat(), "new_age": new_age,
+                        "msg_id": ref["id"], "thread_id": msg.get("threadId"),
                     }
 
     if not best and not best_new:
@@ -1216,7 +1217,15 @@ def render_gmail_tab():
                     unsafe_allow_html=True,
                 )
             else:
-                row = st.columns([5, 1.4, 0.85])
+                def _trash_new(e):
+                    thread_id = e.get("thread_id")
+                    msg_id    = e.get("msg_id")
+                    if thread_id:
+                        trash_gmail_thread(thread_id)
+                    elif msg_id:
+                        trash_gmail_message(msg_id)
+
+                row = st.columns([3.0, 1.4, 1.3, 0.9, 0.85])
                 row[0].markdown(
                     f'<span class="company-name">{e["company"]}</span>'
                     f'&nbsp;{age_badge}'
@@ -1229,7 +1238,24 @@ def render_gmail_tab():
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
                     st.rerun()
-                if row[2].button("Dismiss", key=f"new_dismiss_{i}"):
+                if row[2].button("Add & 🗑", key=f"new_apply_del_{i}"):
+                    add_company(e["company"], e["email_date"])
+                    try:
+                        _trash_new(e)
+                    except Exception as ex:
+                        st.error(f"Failed to delete: {ex}")
+                    updated.add(i)
+                    st.session_state["gmail_updated"] = updated
+                    st.rerun()
+                if row[3].button("🗑", key=f"new_trash_{i}", help="Delete email"):
+                    try:
+                        _trash_new(e)
+                    except Exception as ex:
+                        st.error(f"Failed to delete: {ex}")
+                    dismissed.add(i)
+                    st.session_state["gmail_dismissed"] = dismissed
+                    st.rerun()
+                if row[4].button("Dismiss", key=f"new_dismiss_{i}"):
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
