@@ -1111,6 +1111,9 @@ def render_gmail_tab():
         st.session_state["gmail_dismissed"] = set()
         st.session_state["gmail_rejected"]  = set()
         st.session_state["gmail_undo"]      = {}
+        for k in list(st.session_state.keys()):
+            if k.startswith("new_sel_"):
+                del st.session_state[k]
         st.rerun()
 
     if os.path.exists(TOKEN_FILE) and c2.button("Disconnect Gmail"):
@@ -1322,10 +1325,55 @@ def render_gmail_tab():
     # ── New companies not yet in tracker ──
     if new_vis:
         st.markdown("")
-        st.markdown(f"**New companies found ({len(new_vis)})**")
+
+        def _trash_new(e):
+            tid = e.get("thread_id")
+            mid = e.get("msg_id")
+            if tid:  trash_gmail_thread(tid)
+            elif mid: trash_gmail_message(mid)
+
+        action_vis   = [(i, e) for i, e in new_vis if i not in updated]
+        selected_ids = [i for i, _ in action_vis if st.session_state.get(f"new_sel_{i}", False)]
+        n_sel        = len(selected_ids)
+        n_total      = len(action_vis)
+
+        # Header row
+        hc1, hc2 = st.columns([3.5, 1.0])
+        hc1.markdown(f"**New companies found ({len(new_vis)})**")
+        if action_vis:
+            sel_label = "Deselect All" if n_sel == n_total else "Select All"
+            if hc2.button(sel_label, key="new_sel_all_btn"):
+                new_val = n_sel < n_total
+                for i, _ in action_vis:
+                    st.session_state[f"new_sel_{i}"] = new_val
+                st.rerun()
+
         st.caption("These companies were in your emails but aren't in your tracker yet.")
+
+        # Bulk action bar — shown when at least one is checked
+        if n_sel > 0:
+            bc1, bc2, bc3, _ = st.columns([1.6, 1.4, 1.0, 2.5])
+            if bc1.button(f"Add {n_sel} to Tracker", type="primary", key="new_bulk_add"):
+                for bi in selected_ids:
+                    be = next(e for j, e in action_vis if j == bi)
+                    add_company(be["company"], be["email_date"])
+                    log_application(be["company"], be.get("job_title"), be["email_date"], be["subject"])
+                    undo_data[bi] = {"company": be["company"]}
+                    updated.add(bi)
+                    st.session_state.pop(f"new_sel_{bi}", None)
+                st.session_state["gmail_updated"] = updated
+                st.session_state["gmail_undo"]    = undo_data
+                st.rerun()
+            if bc2.button(f"Dismiss {n_sel}", key="new_bulk_dismiss"):
+                for bi in selected_ids:
+                    dismissed.add(bi)
+                    st.session_state.pop(f"new_sel_{bi}", None)
+                st.session_state["gmail_dismissed"] = dismissed
+                st.rerun()
+
+        # Per-row rendering
         for i, e in new_vis:
-            new_age  = e.get("new_age")
+            new_age   = e.get("new_age")
             age_badge = _age_badge(new_age)
             _, sender_addr = parseaddr(e.get("sender", ""))
             sender_html = (
@@ -1353,31 +1401,25 @@ def render_gmail_tab():
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
             else:
-                def _trash_new(e):
-                    thread_id = e.get("thread_id")
-                    msg_id    = e.get("msg_id")
-                    if thread_id:
-                        trash_gmail_thread(thread_id)
-                    elif msg_id:
-                        trash_gmail_message(msg_id)
-
-                row = st.columns([3.0, 1.4, 1.3, 0.9, 0.85])
-                row[0].markdown(
+                row = st.columns([0.35, 2.65, 1.4, 1.3, 0.9, 0.85])
+                row[0].checkbox("", key=f"new_sel_{i}", label_visibility="collapsed")
+                row[1].markdown(
                     f'<span class="company-name">{e["company"]}</span>'
                     f'&nbsp;{age_badge}'
                     f'<br><span style="color:#9ca3af;font-size:0.78rem">{e["subject"]}</span>'
                     f'<br>{sender_html}',
                     unsafe_allow_html=True,
                 )
-                if row[1].button("Add to Tracker", key=f"new_apply_{i}", type="primary"):
+                if row[2].button("Add to Tracker", key=f"new_apply_{i}", type="primary"):
                     add_company(e["company"], e["email_date"])
                     log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
                     updated.add(i)
+                    st.session_state.pop(f"new_sel_{i}", None)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
-                if row[2].button("Add & 🗑", key=f"new_apply_del_{i}"):
+                if row[3].button("Add & 🗑", key=f"new_apply_del_{i}"):
                     add_company(e["company"], e["email_date"])
                     log_application(e["company"], e.get("job_title"), e["email_date"], e["subject"])
                     undo_data[i] = {"company": e["company"]}
@@ -1386,19 +1428,22 @@ def render_gmail_tab():
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     updated.add(i)
+                    st.session_state.pop(f"new_sel_{i}", None)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
-                if row[3].button("🗑", key=f"new_trash_{i}", help="Delete email"):
+                if row[4].button("🗑", key=f"new_trash_{i}", help="Delete email"):
                     try:
                         _trash_new(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     dismissed.add(i)
+                    st.session_state.pop(f"new_sel_{i}", None)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
-                if row[4].button("Dismiss", key=f"new_dismiss_{i}"):
+                if row[5].button("Dismiss", key=f"new_dismiss_{i}"):
                     dismissed.add(i)
+                    st.session_state.pop(f"new_sel_{i}", None)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
             body_text = (e.get("body") or "").strip()
