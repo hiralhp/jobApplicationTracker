@@ -287,6 +287,9 @@ TOKEN_FILE       = "token.json"
 ATS_DOMAINS = [
     "lever.co", "greenhouse.io", "greenhouse-mail.io",
     "ashbyhq.com", "workday.com", "smartrecruiters.com",
+    "icims.com", "jobvite.com", "taleo.net", "successfactors.com",
+    "bamboohr.com", "recruitee.com", "breezy.hr", "workable.com",
+    "myworkday.com", "dayforce.com", "adp.com",
 ]
 
 # Priority-ordered: first match wins
@@ -577,6 +580,8 @@ _COMPANY_SUBJECT_PATTERNS = [
     r"\bappl(?:ying|ied|ication)\s+to\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "interest in [working at|joining] Company"
     r"\binterest in\s+(?:working at |joining )?([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "including Company in your job search" (iCIMS format)
+    r"\bincluding\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s+in your\b",
     # "at Company" near end
     r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "joining Company"
@@ -695,6 +700,15 @@ def run_gmail_sync(days=90):
         else:
             # Try to extract company name for untracked companies
             extracted = _extract_company_from_subject(subject)
+
+            # For ATS senders: also scan the first 10 body lines with subject patterns
+            if not extracted and is_ats_sender and body:
+                for line in body.splitlines()[:10]:
+                    line = line.strip()
+                    if len(line) > 5:
+                        extracted = _extract_company_from_subject(line)
+                        if extracted:
+                            break
 
             # Fallback: infer from sender domain (e.g. no-reply@stripe.com → "Stripe")
             if (not extracted
