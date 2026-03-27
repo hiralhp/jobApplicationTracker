@@ -607,31 +607,37 @@ _GENERIC_DOMAIN_BASES = {
 def _is_job_board_sender(domain):
     return any(domain == b or domain.endswith("." + b) for b in _JOB_BOARD_DOMAINS)
 
+# Words that indicate a job level/title, never a company name
+_JOB_LEVEL_WORDS = {"senior", "junior", "staff", "principal", "sr", "jr", "entry", "mid"}
+
 # Ordered patterns: each captures the company name in group 1
 _COMPANY_SUBJECT_PATTERNS = [
     # "applying/applied/application to Company"
     r"\bappl(?:ying|ied|ication)\s+to\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
-    # "interest in [working at|joining] Company"
-    r"\binterest in\s+(?:working at |joining )?([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "interest in working at/joining Company" — requires explicit prefix so job titles aren't caught
+    r"\binterest in\s+(?:working at |joining )([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "including Company in your job search" (iCIMS format)
     r"\bincluding\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s+in your\b",
-    # "at Company" near end
-    r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "at Company" — also allows "we/they" after name (e.g. "At StockX we believe")
+    r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |we |they |\-|[|!?,]|$))",
     # "joining Company"
     r"\bjoining\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "Company - Application…" at subject start
     r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received|thank you)",
     # "… | Company" at subject end
     r"[|]\s*([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*$",
+    # "Company Talent Acquisition" — footer signature pattern
+    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s+Talent\s+Acquisition\b",
 ]
 
 def _extract_company_from_subject(subject):
-    """Parse a company name from an ATS email subject. Returns None if uncertain."""
+    """Parse a company name from an email line. Returns None if uncertain."""
     for pat in _COMPANY_SUBJECT_PATTERNS:
         m = re.search(pat, subject)
         if m:
             name = m.group(1).strip().rstrip(".,- ")
-            if len(name) > 2 and name.split()[0].lower() not in _SKIP_NAMES:
+            first = name.split()[0].lower()
+            if len(name) > 2 and first not in _SKIP_NAMES and first not in _JOB_LEVEL_WORDS:
                 return name
     return None
 
