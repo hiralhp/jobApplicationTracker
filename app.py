@@ -1376,9 +1376,14 @@ Gmail sync is free to set up through Google Cloud.
 
 **Step 3 — Configure the consent screen:**
 1. Go to **APIs & Services → OAuth consent screen**, choose **External**, click **Create**
-2. Enter an app name (e.g. *Job Tracker*) and your email — leave everything else blank
-3. On the **Test users** page add your Gmail address, then save
-4. No need to publish — testing mode works fine for personal use
+2. Fill in the required fields on the first page:
+   - **App name** — e.g. *Job Tracker*
+   - **User support email** — select your email from the dropdown
+   - **Developer contact email** (at the bottom) — enter your email
+3. Click **Save and Continue**
+4. On the **Scopes** page click **Save and Continue** without adding anything
+5. On the **Test users** page click **Add Users**, enter your Gmail address, click **Add**, then **Save and Continue**
+6. No need to publish — testing mode works fine for personal use
 
 **Step 4 — Authorize:**
 1. Restart the app (`streamlit run app.py`)
