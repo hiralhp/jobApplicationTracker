@@ -1453,7 +1453,7 @@ def main():
     st.markdown("<br>", unsafe_allow_html=True)
 
     tab_view, tab_add, tab_jobs, tab_gmail, tab_setup = st.tabs([
-        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📧  Gmail Sync", "⚙️  Setup",
+        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📧  Gmail Sync", "⚙️  Gmail Setup",
     ])
 
     with tab_view:
