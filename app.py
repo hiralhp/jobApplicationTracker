@@ -1352,7 +1352,7 @@ def render_gmail_tab():
 
         # Bulk action bar — shown when at least one is checked
         if n_sel > 0:
-            bc1, bc2, bc3, _ = st.columns([1.6, 1.4, 1.0, 2.5])
+            bc1, bc2, bc3, _ = st.columns([1.6, 1.1, 1.0, 2.0])
             if bc1.button(f"Add {n_sel} to Tracker", type="primary", key="new_bulk_add"):
                 for bi in selected_ids:
                     be = next(e for j, e in action_vis if j == bi)
@@ -1364,7 +1364,18 @@ def render_gmail_tab():
                 st.session_state["gmail_updated"] = updated
                 st.session_state["gmail_undo"]    = undo_data
                 st.rerun()
-            if bc2.button(f"Dismiss {n_sel}", key="new_bulk_dismiss"):
+            if bc2.button(f"🗑 Delete {n_sel}", key="new_bulk_trash"):
+                for bi in selected_ids:
+                    be = next(e for j, e in action_vis if j == bi)
+                    try:
+                        _trash_new(be)
+                    except Exception:
+                        pass
+                    dismissed.add(bi)
+                    st.session_state.pop(f"new_sel_{bi}", None)
+                st.session_state["gmail_dismissed"] = dismissed
+                st.rerun()
+            if bc3.button(f"Dismiss {n_sel}", key="new_bulk_dismiss"):
                 for bi in selected_ids:
                     dismissed.add(bi)
                     st.session_state.pop(f"new_sel_{bi}", None)
