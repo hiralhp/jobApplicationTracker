@@ -1361,50 +1361,7 @@ def render_setup_tab():
         unsafe_allow_html=True,
     )
 
-    with st.expander("① Download the code", expanded=True):
-        st.markdown("""
-Go to **[github.com/hiralhp/jobApplicationTracker](https://github.com/hiralhp/jobApplicationTracker)**
-and click **Code → Download ZIP**. Unzip it anywhere on your computer.
-
-Or if you have Git installed:
-```powershell
-git clone https://github.com/hiralhp/jobApplicationTracker.git
-```
-        """)
-
-    with st.expander("② Install Python", expanded=True):
-        st.markdown("""
-First check if you already have Python installed. In your terminal run:
-```
-python --version
-```
-If you see `Python 3.9` or higher you're good — skip to the next step.
-
-If you get an error or an older version, download and install **Python 3.9+** from **[python.org](https://www.python.org/downloads/)**.
-
-> **Windows:** During installation check **"Add Python to PATH"** before clicking Install.
-        """)
-
-    with st.expander("③ Install dependencies & run the app", expanded=True):
-        st.markdown("""
-Open a terminal in the folder where you downloaded the app:
-- **Windows** → open **PowerShell**, then type `cd` followed by the folder path
-- **Mac** → open **Terminal**, then type `cd` followed by the folder path
-
-Install dependencies:
-```powershell
-pip install streamlit pandas google-auth-oauthlib google-auth-httplib2 google-api-python-client
-```
-
-Start the app:
-```powershell
-streamlit run app.py
-```
-
-A browser window will open automatically. Your data is stored locally in `job_tracker.db` — nobody else can see it.
-        """)
-
-    with st.expander("④ Set up Gmail sync (optional)", expanded=False):
+    with st.expander("① Set up Gmail sync", expanded=True):
         st.markdown("""
 Gmail sync is free to set up through Google Cloud.
 
@@ -1430,7 +1387,7 @@ Gmail sync is free to set up through Google Cloud.
 4. Done! A `token.json` file is saved so you won't need to authorize again
         """)
 
-    with st.expander("⑤ Keeping your data private", expanded=False):
+    with st.expander("② Keeping your data private", expanded=False):
         st.markdown("""
 These files live only on your computer and should never be shared:
 - `credentials.json` — your Google OAuth credentials
