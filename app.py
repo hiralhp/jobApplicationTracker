@@ -558,6 +558,16 @@ _JOB_BOARD_DOMAINS = {
     "handshake.com", "joinhandshake.com", "idealist.org",
 }
 
+# Domain base names that don't identify a specific company
+_GENERIC_DOMAIN_BASES = {
+    "gmail", "yahoo", "outlook", "hotmail", "icloud", "protonmail",
+    "mail", "email", "info", "support", "contact", "help", "hr",
+    "jobs", "recruiting", "careers", "apply", "talent",
+    "notification", "notifications", "noreply", "no-reply",
+    "service", "services", "team", "hello", "hello", "bounce",
+    "send", "mg", "smtp", "relay",
+}
+
 def _is_job_board_sender(domain):
     return any(domain == b or domain.endswith("." + b) for b in _JOB_BOARD_DOMAINS)
 
@@ -565,10 +575,14 @@ def _is_job_board_sender(domain):
 _COMPANY_SUBJECT_PATTERNS = [
     # "applying/applied/application to Company"
     r"\bappl(?:ying|ied|ication)\s+to\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "interest in [working at|joining] Company"
+    r"\binterest in\s+(?:working at |joining )?([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "at Company" near end
     r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "joining Company"
+    r"\bjoining\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "Company - Application…" at subject start
-    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received)",
+    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received|thank you)",
     # "… | Company" at subject end
     r"[|]\s*([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*$",
 ]
@@ -679,8 +693,19 @@ def run_gmail_sync(days=90):
                     "thread_id": msg.get("threadId"),
                 }
         else:
-            # Try to extract company name from subject for untracked companies
+            # Try to extract company name for untracked companies
             extracted = _extract_company_from_subject(subject)
+
+            # Fallback: infer from sender domain (e.g. no-reply@stripe.com → "Stripe")
+            if (not extracted
+                    and not is_ats_sender
+                    and sender_domain
+                    and not _is_job_board_sender(sender_domain)):
+                parts = sender_domain.split(".")
+                base  = parts[-2] if len(parts) >= 2 else parts[0]
+                if base and base not in _GENERIC_DOMAIN_BASES:
+                    extracted = base.capitalize()
+
             if extracted:
                 key = extracted.lower()
                 if key not in tracked_names and key not in best_new:
