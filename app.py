@@ -19,30 +19,6 @@ except ImportError:
 
 DB_PATH = "job_tracker.db"
 
-SEED_APPLIED = [
-    "Anthropic", "Cohere", "Perplexity", "Scale AI", "Sierra",
-    "Harvey", "Decagon", "Dust", "Hebbia", "Glean",
-    "Palantir", "Ramp", "Retool", "Mistral AI",
-]
-SEED_DATE = "2026-03-22"
-
-SEED_NO_DATE = [
-    "Notion", "Linear", "Airtable", "Vercel", "Hex",
-    "Meta", "Amazon", "Microsoft", "Netflix", "Dropbox",
-    "Doordash", "Lyft", "Uber",
-    # AI / LLM
-    "OpenAI", "xAI", "Hugging Face", "Runway", "ElevenLabs", "Groq",
-    "Together AI", "Inflection AI", "Character AI",
-    # Dev tools / infra
-    "Stripe", "Figma", "Databricks", "Snowflake", "Supabase",
-    "PostHog", "Datadog", "HashiCorp",
-    # Productivity / SaaS
-    "Coda", "Loom", "Miro", "Asana", "ClickUp", "Monday",
-    # Fintech
-    "Plaid", "Brex", "Rippling", "Robinhood", "Coinbase",
-    # Other
-    "Box", "Slack", "Intercom", "Atlassian",
-]
 
 CSS = """
 <style>
@@ -245,26 +221,6 @@ def init_db():
         """)
         conn.commit()
 
-
-def seed_data():
-    with get_conn() as conn:
-        existing = {r[0] for r in conn.execute("SELECT name FROM companies").fetchall()}
-        to_add = []
-        for c in SEED_APPLIED:
-            if c not in existing:
-                to_add.append((c, SEED_DATE))
-        if to_add:
-            conn.executemany(
-                "INSERT INTO companies (name, last_applied, interval_days, notes, careers_url) VALUES (?, ?, 7, '', '')",
-                to_add,
-            )
-        no_date_add = [(c,) for c in SEED_NO_DATE if c not in existing]
-        if no_date_add:
-            conn.executemany(
-                "INSERT INTO companies (name, interval_days, notes, careers_url) VALUES (?, 7, '', '')",
-                no_date_add,
-            )
-        conn.commit()
 
 
 def get_companies():
@@ -1483,7 +1439,6 @@ def main():
     st.set_page_config(page_title="Job Application Tracker", layout="wide", page_icon="🔍")
     st.markdown(CSS, unsafe_allow_html=True)
     init_db()
-    seed_data()
 
     st.markdown("## 🔍 Job Application Tracker")
     st.caption(f"Today · {date.today().strftime('%B %d, %Y')}")
