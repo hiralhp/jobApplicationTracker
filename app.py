@@ -1170,7 +1170,7 @@ def render_gmail_tab():
     if new_vis:
         st.markdown("")
         st.markdown(f"**New companies found ({len(new_vis)})**")
-        st.caption("These companies were in your ATS emails but aren't in your tracker yet.")
+        st.caption("These companies were in your emails but aren't in your tracker yet.")
         for i, e in new_vis:
             new_age  = e.get("new_age")
             age_badge = _age_badge(new_age)
