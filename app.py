@@ -1153,8 +1153,13 @@ def render_gmail_tab():
             return '<span class="badge" style="background:#d1d5db;color:#6b7280">never</span>'
         return f'<span class="badge" style="background:{staleness_color(d)}">{d}d</span>'
 
+    def _most_recent_age(e):
+        ages = [days_ago(e.get("last_checked")), days_ago(e.get("last_applied"))]
+        valid = [a for a in ages if a is not None]
+        return min(valid) if valid else None
+
     def _render_item(i, e, key_prefix, already_uptodate=False):
-        current_age = days_ago(e.get("last_checked"))
+        current_age = _most_recent_age(e)
         new_age     = e.get("new_age")
         age_html    = f'{_age_badge(current_age)} → {_age_badge(new_age)}'
         _, sender_addr = parseaddr(e.get("sender", ""))
@@ -1291,16 +1296,23 @@ def render_gmail_tab():
     new_items     = [e for e in items if e["type"] == "new"]
 
     # For tracked companies: split changed vs same age
+    # "changed" = email is newer than the most recent recorded activity
+    def _email_is_newer(e):
+        cur = _most_recent_age(e)
+        new = e.get("new_age")
+        if cur is None:  return True   # nothing recorded yet
+        if new is None:  return False
+        return new < cur               # email is more recent
+
     changed = [(i, e) for i, e in enumerate(items)
                if e["type"] == "pending"
                and i not in dismissed
                and i not in rejected
-               and days_ago(e.get("last_checked")) != e.get("new_age")]
+               and _email_is_newer(e)]
     same    = [(i, e) for i, e in enumerate(items)
                if e["type"] == "pending"
                and i not in dismissed
-               and (days_ago(e.get("last_checked")) == e.get("new_age")
-                    or i in rejected)]
+               and (not _email_is_newer(e) or i in rejected)]
     new_vis = [(i, e) for i, e in enumerate(items)
                if e["type"] == "new" and i not in dismissed]
 
