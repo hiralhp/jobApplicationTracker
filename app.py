@@ -1637,6 +1637,89 @@ def render_jobs_tab():
         st.markdown('<hr class="row-divider">', unsafe_allow_html=True)
 
 
+def render_stats_tab():
+    st.subheader("Application Stats")
+    st.caption("🧪 Beta · Based on confirmation emails logged via Gmail Sync")
+
+    with get_conn() as conn:
+        apps = conn.execute(
+            "SELECT company_name, job_title, applied_date FROM applications ORDER BY applied_date DESC"
+        ).fetchall()
+
+    if not apps:
+        st.info("No data yet — run Gmail Sync on tracked companies to populate this tab.")
+        return
+
+    df = pd.DataFrame(apps, columns=["company", "job_title", "applied_date"])
+    df["applied_date"] = pd.to_datetime(df["applied_date"], errors="coerce")
+    df = df.dropna(subset=["applied_date"])
+
+    if df.empty:
+        st.info("No dated application records found.")
+        return
+
+    today    = pd.Timestamp.today().normalize()
+    df["days_ago"] = (today - df["applied_date"]).dt.days
+
+    # ── Overview metrics ──
+    total      = len(df)
+    unique_cos = df["company"].nunique()
+    last7      = int((df["days_ago"] <= 7).sum())
+    last30     = int((df["days_ago"] <= 30).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Applications", total)
+    c2.metric("Unique Companies",   unique_cos)
+    c3.metric("Last 7 Days",        last7)
+    c4.metric("Last 30 Days",       last30)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Weekly activity chart (last 12 weeks) ──
+    st.markdown("**Applications per week — last 12 weeks**")
+    df12 = df[df["days_ago"] <= 84].copy()
+    if not df12.empty:
+        df12["week"] = df12["applied_date"].dt.to_period("W").apply(lambda p: p.start_time)
+        weekly = df12.groupby("week").size().rename("Applications")
+        st.bar_chart(weekly)
+    else:
+        st.caption("No applications in the last 12 weeks.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Top companies & titles ──
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Top companies**")
+        top_cos = df.groupby("company").size().sort_values(ascending=False).head(10)
+        rows = [f"| {co} | {cnt} |" for co, cnt in top_cos.items()]
+        st.markdown("| Company | Apps |\n|---|---|\n" + "\n".join(rows))
+
+    with col2:
+        st.markdown("**Top job titles**")
+        titles = df["job_title"].dropna()
+        if not titles.empty:
+            top_t = titles.value_counts().head(10)
+            rows = [f"| {t} | {cnt} |" for t, cnt in top_t.items()]
+            st.markdown("| Title | Count |\n|---|---|\n" + "\n".join(rows))
+        else:
+            st.caption("No job titles extracted yet. They'll appear after future syncs.")
+
+    # ── Cadence ──
+    sorted_dates = df["applied_date"].sort_values()
+    if len(sorted_dates) > 1:
+        st.markdown("<br>", unsafe_allow_html=True)
+        gaps     = sorted_dates.diff().dt.days.dropna()
+        avg_gap  = gaps.mean()
+        med_gap  = gaps.median()
+        busiest  = df.groupby("company").size().idxmax()
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Avg. days between apps", f"{avg_gap:.1f}d")
+        g2.metric("Median gap",             f"{med_gap:.1f}d")
+        g3.metric("Most applied to",        busiest)
+
+
 def render_setup_tab():
     st.subheader("Setup Guide")
     st.markdown(
@@ -1700,8 +1783,8 @@ def main():
     st.caption(f"Today · {date.today().strftime('%B %d, %Y')}")
     st.markdown("<br>", unsafe_allow_html=True)
 
-    tab_view, tab_add, tab_jobs, tab_gmail, tab_setup = st.tabs([
-        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📧  Gmail Sync", "⚙️  Gmail Setup",
+    tab_view, tab_add, tab_jobs, tab_stats, tab_gmail, tab_setup = st.tabs([
+        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📊  Stats", "📧  Gmail Sync", "⚙️  Gmail Setup",
     ])
 
     with tab_view:
@@ -1712,6 +1795,9 @@ def main():
 
     with tab_jobs:
         render_jobs_tab()
+
+    with tab_stats:
+        render_stats_tab()
 
     with tab_gmail:
         render_gmail_tab()
