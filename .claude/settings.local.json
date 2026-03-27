@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /c/Users/patel/claudProjects/jobTracker && C:/Users/patel/AppData/Local/Programs/Python/Python312/python.exe -m pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client 2>&1)",
+      "Bash(cd:*)",
+      "Bash(sqlite3:*)",
+      "Bash(cd \"/c/Users/patel/claudProjects/jobTracker\" && python3 << 'EOF'\nimport sqlite3\nconn = sqlite3.connect\\(\"job_tracker.db\"\\)\ncursor = conn.cursor\\(\\)\n\n# Get schema\ncursor.execute\\(\"SELECT sql FROM sqlite_master WHERE type='table'\"\\)\nfor row in cursor.fetchall\\(\\):\n    print\\(row[0]\\)\n    print\\(\\)\n\n# Get sample data\nprint\\(\"\\\\n=== COMPANIES TABLE ===\"\\)\ncursor.execute\\(\"SELECT * FROM companies LIMIT 3\"\\)\ncols = [desc[0] for desc in cursor.description]\nprint\\(cols\\)\nfor row in cursor.fetchall\\(\\):\n    print\\(row\\)\n\nprint\\(\"\\\\n=== JOB_POSTINGS TABLE ===\"\\)\ncursor.execute\\(\"SELECT * FROM job_postings LIMIT 3\"\\)\ncols = [desc[0] for desc in cursor.description]\nprint\\(cols\\)\nfor row in cursor.fetchall\\(\\):\n    print\\(row\\)\n\nconn.close\\(\\)\nEOF)"
+    ]
+  }
+}

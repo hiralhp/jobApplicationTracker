@@ -1,0 +1,11 @@
+# Secrets — never commit these
+credentials.json
+token.json
+
+# Database — contains your personal data
+job_tracker.db
+
+# Python
+__pycache__/
+*.pyc
+.env
