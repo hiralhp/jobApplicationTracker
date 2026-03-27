@@ -475,14 +475,20 @@ _REJECT_SIGNALS = [
     "will not be moving forward",
     "decided to proceed with other candidates",
     "decided to move forward with other",
+    "decided to move forward with candidates",
     "chosen to move forward with other",
     "moving forward with other candidates",
+    "move forward with other applicants",
+    "pursue other candidates",
+    "pursuing other candidates",
     "not selected for this position",
     "not selected for this role",
+    "not selected for an interview",
     "not a fit for this role",
     "not a fit for this position",
     "have decided not to",
     "chosen not to move forward",
+    "not be moving forward with your candidacy",
 ]
 
 def _is_application_confirmation(subject, body):
@@ -567,8 +573,9 @@ _GENERIC_DOMAIN_BASES = {
     "mail", "email", "info", "support", "contact", "help", "hr",
     "jobs", "recruiting", "careers", "apply", "talent",
     "notification", "notifications", "noreply", "no-reply",
-    "service", "services", "team", "hello", "hello", "bounce",
-    "send", "mg", "smtp", "relay",
+    "service", "services", "team", "hello", "bounce",
+    "send", "mg", "smtp", "relay", "sendgrid", "mailgun",
+    "mailchimp", "constantcontact", "klaviyo", "marketo",
 }
 
 def _is_job_board_sender(domain):
@@ -689,10 +696,12 @@ def run_gmail_sync(days=90):
                                company_row[5] or "", sender_addr_l)
 
             if key not in best:
-                last_checked = company_row[2] if company_row else None
+                last_checked  = company_row[2] if company_row else None
+                last_applied  = company_row[7] if company_row else None
                 best[key] = {
                     "type": "pending", "company": company, "subject": subject,
                     "sender": sender, "body": body, "last_checked": last_checked,
+                    "last_applied": last_applied,
                     "email_date": email_date.isoformat(), "new_age": new_age,
                     "msg_id": ref["id"],
                     "thread_id": msg.get("threadId"),
@@ -701,8 +710,8 @@ def run_gmail_sync(days=90):
             # Try to extract company name for untracked companies
             extracted = _extract_company_from_subject(subject)
 
-            # For ATS senders: also scan the first 10 body lines with subject patterns
-            if not extracted and is_ats_sender and body:
+            # Scan first 10 body lines when subject is generic (e.g. "Application Confirmation")
+            if not extracted and body:
                 for line in body.splitlines()[:10]:
                     line = line.strip()
                     if len(line) > 5:
@@ -1021,6 +1030,7 @@ def render_gmail_tab():
         st.session_state["gmail_updated"]   = set()
         st.session_state["gmail_dismissed"] = set()
         st.session_state["gmail_rejected"]  = set()
+        st.session_state["gmail_undo"]      = {}
         st.rerun()
 
     if os.path.exists(TOKEN_FILE) and c2.button("Disconnect Gmail"):
@@ -1039,6 +1049,7 @@ def render_gmail_tab():
     updated   = st.session_state.get("gmail_updated",   set())
     dismissed = st.session_state.get("gmail_dismissed", set())
     rejected  = st.session_state.get("gmail_rejected",  set())
+    undo_data = st.session_state.get("gmail_undo",       {})
 
     errors  = [e for e in log if e["type"] == "error"]
     infos   = [e for e in log if e["type"] == "info"]
@@ -1067,7 +1078,8 @@ def render_gmail_tab():
             if sender_addr else ""
         )
         if i in updated:
-            st.markdown(
+            ucols = st.columns([7.5, 1.0])
+            ucols[0].markdown(
                 f'✅ &nbsp;<span class="company-name">{e["company"]}</span>'
                 f'&nbsp;{age_html}&nbsp;'
                 f'<span style="color:#16a34a;font-size:0.82rem">marked applied</span>'
@@ -1075,6 +1087,19 @@ def render_gmail_tab():
                 f'<br><span style="padding-left:1.4rem">{sender_html}</span>',
                 unsafe_allow_html=True,
             )
+            if i in undo_data and ucols[1].button("Undo", key=f"{key_prefix}_undo_{i}"):
+                info = undo_data[i]
+                with get_conn() as conn:
+                    conn.execute(
+                        "UPDATE companies SET last_applied = ? WHERE LOWER(name) = LOWER(?)",
+                        (info.get("old_applied"), info["company"]),
+                    )
+                    conn.commit()
+                updated.discard(i)
+                del undo_data[i]
+                st.session_state["gmail_updated"] = updated
+                st.session_state["gmail_undo"]    = undo_data
+                st.rerun()
         elif i in rejected:
             st.markdown(
                 f'❌ &nbsp;<span class="company-name">{e["company"]}</span>'
@@ -1135,11 +1160,14 @@ def render_gmail_tab():
                     st.rerun()
             else:
                 if row[1].button("Update Tracker", key=f"{key_prefix}_apply_{i}", type="primary"):
+                    undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
+                    st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
                 if row[2].button("Update & 🗑", key=f"{key_prefix}_apply_del_{i}"):
+                    undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
                     try:
                         _trash_thread(e)
@@ -1147,6 +1175,7 @@ def render_gmail_tab():
                         st.error(f"Failed to delete: {ex}")
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
+                    st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
                 if row[3].button("Reject", key=f"{key_prefix}_reject_{i}"):
                     mark_company_rejected(e["company"])
@@ -1222,7 +1251,8 @@ def render_gmail_tab():
                 if sender_addr else ""
             )
             if i in updated:
-                st.markdown(
+                ucols = st.columns([7.5, 1.0])
+                ucols[0].markdown(
                     f'✅ &nbsp;<span class="company-name">{e["company"]}</span>'
                     f'&nbsp;{age_badge}&nbsp;'
                     f'<span style="color:#16a34a;font-size:0.82rem">added to tracker</span>'
@@ -1230,6 +1260,16 @@ def render_gmail_tab():
                     f'<br><span style="padding-left:1.4rem">{sender_html}</span>',
                     unsafe_allow_html=True,
                 )
+                if i in undo_data and ucols[1].button("Undo", key=f"new_undo_{i}"):
+                    for r in get_companies():
+                        if r[1].lower() == e["company"].lower():
+                            delete_company(r[0])
+                            break
+                    updated.discard(i)
+                    del undo_data[i]
+                    st.session_state["gmail_updated"] = updated
+                    st.session_state["gmail_undo"]    = undo_data
+                    st.rerun()
             else:
                 def _trash_new(e):
                     thread_id = e.get("thread_id")
@@ -1249,17 +1289,21 @@ def render_gmail_tab():
                 )
                 if row[1].button("Add to Tracker", key=f"new_apply_{i}", type="primary"):
                     add_company(e["company"], e["email_date"])
+                    undo_data[i] = {"company": e["company"]}
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
+                    st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
                 if row[2].button("Add & 🗑", key=f"new_apply_del_{i}"):
                     add_company(e["company"], e["email_date"])
+                    undo_data[i] = {"company": e["company"]}
                     try:
                         _trash_new(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
+                    st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
                 if row[3].button("🗑", key=f"new_trash_{i}", help="Delete email"):
                     try:
