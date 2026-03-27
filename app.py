@@ -791,7 +791,9 @@ def render_companies_tab():
             st.markdown(f'<div style="padding:1.5rem 0;text-align:center;color:#9ca3af;font-size:0.9rem">{empty_msg}</div>', unsafe_allow_html=True)
             return
         for cid, name, last_checked, _, notes, careers_url, recruiting_email, last_applied in group:
-            d     = days_ago(last_checked)
+            # Age badge = most recent activity (applied or checked)
+            most_recent = last_applied if (last_checked is None or (last_applied and last_applied > last_checked)) else last_checked
+            d     = days_ago(most_recent)
             color = staleness_color(d)
 
             age_html  = (
