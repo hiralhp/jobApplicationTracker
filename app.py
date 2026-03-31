@@ -1,12 +1,17 @@
+import json
 import os
 import re
 import base64
 import streamlit as st
 import sqlite3
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 from email.utils import parseaddr
 from urllib.parse import urlparse
 import pandas as pd
+
+from email_classifier import classify_email
+from email_classifier.config import ATS_DOMAINS
 
 try:
     from google.oauth2.credentials import Credentials
@@ -163,6 +168,59 @@ def get_conn():
     return sqlite3.connect(DB_PATH)
 
 
+def _backfill_v2(conn):
+    """One-time backfill for schema version 2. Idempotent (uses COALESCE / IS NULL guards)."""
+    # Normalize company name + job title
+    conn.execute("""
+        UPDATE applications SET
+            company_normalized   = LOWER(TRIM(company_name)),
+            job_title_normalized = LOWER(TRIM(REPLACE(REPLACE(COALESCE(job_title,''),'-',' '),'.',' ')))
+        WHERE company_normalized IS NULL
+    """)
+    # Backfill timing columns from existing decision_date
+    conn.execute("""
+        UPDATE applications SET rejected_at = COALESCE(rejected_at, decision_date)
+        WHERE decision_type = 'Rejected' AND decision_date IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE applications SET interview_at = COALESCE(interview_at, decision_date)
+        WHERE decision_type = 'Interviewing' AND decision_date IS NOT NULL
+    """)
+    conn.execute("""
+        UPDATE applications SET first_response_at = COALESCE(first_response_at, decision_date)
+        WHERE decision_date IS NOT NULL AND first_response_at IS NULL
+    """)
+    # latest_status / latest_status_at
+    conn.execute("""
+        UPDATE applications SET latest_status =
+            COALESCE(CASE WHEN decision_type IN ('Rejected','Interviewing','Offer')
+                          THEN decision_type END, 'Applied')
+        WHERE latest_status IS NULL
+    """)
+    conn.execute("""
+        UPDATE applications SET latest_status_at = COALESCE(latest_status_at, decision_date, applied_date)
+        WHERE latest_status_at IS NULL
+    """)
+    # Re-link existing email_classifications rows
+    label_to_type = {"rejection": "Rejected", "interview": "Interviewing", "offer": "Offer"}
+    rows = conn.execute(
+        "SELECT id, gmail_msg_id, email_date, label FROM email_classifications "
+        "WHERE application_id IS NULL AND label IN ('rejection','interview','offer')"
+    ).fetchall()
+    for row_id, _, email_date, label in rows:
+        decision_type = label_to_type[label]
+        candidates = conn.execute(
+            "SELECT id FROM applications WHERE decision_date = ? AND decision_type = ?",
+            (email_date, decision_type),
+        ).fetchall()
+        if len(candidates) == 1:
+            conn.execute(
+                "UPDATE email_classifications SET application_id = ?, match_method = 'backfill_date_type' WHERE id = ?",
+                (candidates[0][0], row_id),
+            )
+
+
+
 def init_db():
     with get_conn() as conn:
         conn.execute("""
@@ -218,6 +276,27 @@ def init_db():
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # migrate: add decision columns if missing
+        app_cols = [r[1] for r in conn.execute("PRAGMA table_info(applications)").fetchall()]
+        if "decision_date" not in app_cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN decision_date DATE")
+        if "decision_type" not in app_cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN decision_type TEXT")
+        new_app_cols = {
+            "company_normalized":         "TEXT",
+            "job_title_normalized":       "TEXT",
+            "latest_status":              "TEXT DEFAULT 'Applied'",
+            "latest_status_at":           "DATE",
+            "rejected_at":                "DATE",
+            "interview_at":               "DATE",
+            "first_response_at":          "DATE",
+            "source_confirmation_msg_id": "TEXT",
+            "source_rejection_msg_id":    "TEXT",
+            "source_interview_msg_id":    "TEXT",
+        }
+        for col, typedef in new_app_cols.items():
+            if col not in app_cols:
+                conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {typedef}")
         # job_postings table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS job_postings (
@@ -230,6 +309,37 @@ def init_db():
                 notes       TEXT    DEFAULT ''
             )
         """)
+        # email classifications log
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS email_classifications (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                gmail_msg_id    TEXT    NOT NULL,
+                gmail_thread_id TEXT,
+                email_date      DATE    NOT NULL,
+                sender          TEXT    NOT NULL DEFAULT '',
+                subject         TEXT    NOT NULL DEFAULT '',
+                label           TEXT    NOT NULL,
+                confidence      REAL    NOT NULL,
+                evidence        TEXT    NOT NULL DEFAULT '',
+                classified_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                classifier_ver  TEXT    NOT NULL DEFAULT '1.0'
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_email_clf_msg
+                ON email_classifications (gmail_msg_id)
+        """)
+        clf_cols = [r[1] for r in conn.execute("PRAGMA table_info(email_classifications)").fetchall()]
+        for col, typedef in [("application_id", "INTEGER"), ("match_method", "TEXT")]:
+            if col not in clf_cols:
+                conn.execute(f"ALTER TABLE email_classifications ADD COLUMN {col} {typedef}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_app_company_norm  ON applications (company_normalized)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_app_latest_status ON applications (latest_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_clf_app_id        ON email_classifications (application_id)")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 2:
+            _backfill_v2(conn)
+            conn.execute("PRAGMA user_version = 2")
         conn.commit()
 
 
@@ -237,7 +347,15 @@ def init_db():
 def get_companies():
     with get_conn() as conn:
         return conn.execute(
-            "SELECT id, name, last_checked, interval_days, notes, careers_url, recruiting_email, last_applied FROM companies ORDER BY last_checked IS NOT NULL, last_checked ASC, name ASC"
+            """SELECT id, name, last_checked, interval_days, notes, careers_url, recruiting_email, last_applied FROM companies ORDER BY
+               CASE WHEN last_checked IS NULL AND last_applied IS NULL THEN 0 ELSE 1 END ASC,
+               CASE
+                 WHEN last_checked IS NULL THEN last_applied
+                 WHEN last_applied IS NULL THEN last_checked
+                 WHEN last_checked > last_applied THEN last_checked
+                 ELSE last_applied
+               END ASC,
+               name ASC"""
         ).fetchall()
 
 
@@ -250,19 +368,79 @@ def add_company(name, last_applied=None, notes="", careers_url="", recruiting_em
         conn.commit()
 
 
-def log_application(company_name, job_title, applied_date, email_subject=""):
-    """Insert one row into the applications log (no-op if duplicate within same day)."""
+def log_application(company_name, job_title, applied_date, email_subject="", gmail_msg_id=None):
+    """Insert one row into the applications log (no-op if duplicate)."""
     with get_conn() as conn:
+        if gmail_msg_id:
+            exists = conn.execute(
+                "SELECT 1 FROM applications WHERE source_confirmation_msg_id = ?",
+                (gmail_msg_id,),
+            ).fetchone()
+            if exists:
+                return
         exists = conn.execute(
-            "SELECT 1 FROM applications WHERE LOWER(company_name)=LOWER(?) AND applied_date=?",
-            (company_name, applied_date),
+            "SELECT 1 FROM applications WHERE LOWER(company_name)=LOWER(?) AND applied_date=? "
+            "AND LOWER(COALESCE(job_title,''))=LOWER(COALESCE(?,''))",
+            (company_name, applied_date, job_title),
         ).fetchone()
         if not exists:
+            norm_company = company_name.lower().strip() if company_name else None
+            norm_title   = _normalize_title(job_title)
             conn.execute(
-                "INSERT INTO applications (company_name, job_title, applied_date, email_subject) VALUES (?, ?, ?, ?)",
-                (company_name, job_title or None, applied_date, email_subject or None),
+                """INSERT INTO applications
+                   (company_name, job_title, applied_date, email_subject,
+                    company_normalized, job_title_normalized,
+                    latest_status, latest_status_at, source_confirmation_msg_id)
+                   VALUES (?, ?, ?, ?, ?, ?, 'Applied', ?, ?)""",
+                (company_name, job_title or None, applied_date, email_subject or None,
+                 norm_company, norm_title, applied_date, gmail_msg_id),
             )
             conn.commit()
+
+
+def update_application_decision(company_name, decision_type, decision_date,
+                                application_id=None, gmail_msg_id=None):
+    """Set decision columns on the matching application row."""
+    with get_conn() as conn:
+        if application_id is None:
+            open_apps = conn.execute(
+                "SELECT id FROM applications WHERE LOWER(company_name)=LOWER(?) AND decision_date IS NULL",
+                (company_name,),
+            ).fetchall()
+            if len(open_apps) == 0:
+                return
+            if len(open_apps) >= 2:
+                return  # ambiguous — don't guess
+            application_id = open_apps[0][0]
+
+        set_clauses = [
+            "decision_date = ?", "decision_type = ?",
+            "latest_status = ?", "latest_status_at = ?",
+        ]
+        params = [decision_date, decision_type, decision_type, decision_date]
+
+        if decision_type == "Rejected":
+            set_clauses.append("rejected_at = COALESCE(rejected_at, ?)")
+            params.append(decision_date)
+            if gmail_msg_id:
+                set_clauses.append("source_rejection_msg_id = COALESCE(source_rejection_msg_id, ?)")
+                params.append(gmail_msg_id)
+        elif decision_type == "Interviewing":
+            set_clauses.append("interview_at = COALESCE(interview_at, ?)")
+            params.append(decision_date)
+            if gmail_msg_id:
+                set_clauses.append("source_interview_msg_id = COALESCE(source_interview_msg_id, ?)")
+                params.append(gmail_msg_id)
+
+        set_clauses.append("first_response_at = COALESCE(first_response_at, ?)")
+        params.append(decision_date)
+        params.append(application_id)
+
+        conn.execute(
+            f"UPDATE applications SET {', '.join(set_clauses)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
 
 
 def mark_scraped(company_id):
@@ -310,55 +488,6 @@ GMAIL_SCOPES     = ["https://www.googleapis.com/auth/gmail.modify"]
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE       = "token.json"
 
-ATS_DOMAINS = [
-    "lever.co", "greenhouse.io", "greenhouse-mail.io",
-    "ashbyhq.com", "workday.com", "smartrecruiters.com",
-    "icims.com", "jobvite.com", "taleo.net", "successfactors.com",
-    "bamboohr.com", "recruitee.com", "breezy.hr", "workable.com",
-    "myworkday.com", "dayforce.com", "adp.com",
-]
-
-# Priority-ordered: first match wins
-KEYWORD_STATUS_MAP = [
-    (["offer letter", "pleased to offer", "extend an offer",
-      "job offer", "employment offer"], "Offer"),
-    (["we'd like to move forward", "move forward with your application",
-      "next steps", "interview", "schedule a call", "phone screen",
-      "technical assessment", "take-home"], "Interviewing"),
-    (["unfortunately", "not moving forward", "not selected", "other candidates",
-      "will not be moving", "won't be moving", "decided not to proceed",
-      "going in a different direction"], "Rejected"),
-    (["application received", "received your application", "thank you for applying",
-      "successfully submitted", "we've received", "have received your application",
-      "application has been received"], "Applied"),
-]
-
-# Keywords that reliably identify application-confirmation emails (subject takes priority)
-_CONFIRM_SUBJ_KWS = [
-    "thank you for applying",
-    "thanks for applying",
-    "thank you for your application",
-    "thanks for your application",
-    "thank you for your interest",
-    "thanks for your interest",
-    "application received",
-    "application confirmation",
-    "we received your application",
-    "application submitted",
-    "successfully applied",
-    "you've applied",
-]
-_CONFIRM_BODY_KWS = [
-    "received your application",
-    "we received your application",
-    "have received your application",
-    "we have received your application",
-    "thank you for applying",
-    "thanks for applying",
-    "application has been received",
-    "we've received your application",
-    "successfully submitted your application",
-]
 # Gmail subject-search terms used to widen the fetch beyond ATS domains
 _GMAIL_SUBJECT_TERMS = [
     'subject:("thank you for applying")',
@@ -471,74 +600,65 @@ def trash_gmail_thread(thread_id):
     svc.users().threads().trash(userId="me", id=thread_id).execute()
 
 
+def _strip_html(html: str) -> str:
+    """Strip HTML tags and return readable plain text."""
+    from html.parser import HTMLParser
+
+    class _Stripper(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self._parts: list = []
+            self._skip = False
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("style", "script", "head"):
+                self._skip = True
+            elif tag in ("br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4"):
+                self._parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("style", "script", "head"):
+                self._skip = False
+
+        def handle_data(self, data):
+            if not self._skip:
+                self._parts.append(data)
+
+    try:
+        parser = _Stripper()
+        parser.feed(html)
+        text = "".join(parser._parts)
+    except Exception:
+        return ""
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _extract_email_body(payload, max_chars=3000):
+    """Extract body text from a Gmail message payload.
+
+    Prefers text/plain; falls back to stripped text/html when no plain-text
+    part exists (common for HTML-only corporate/ATS emails).
+    For multipart/alternative, RFC 2046 guarantees plain comes before HTML in
+    the parts list, so iterating in order naturally picks plain first.
+    """
     mime = payload.get("mimeType", "")
     if mime == "text/plain":
         data = payload.get("body", {}).get("data", "")
         if data:
             return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")[:max_chars]
+    if mime == "text/html":
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            html = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+            return _strip_html(html)[:max_chars]
     if mime.startswith("multipart/"):
         for part in payload.get("parts", []):
             text = _extract_email_body(part, max_chars)
             if text:
                 return text
     return ""
-
-
-def _infer_status(subject, body):
-    text = (subject + " " + body).lower()
-    for keywords, status in KEYWORD_STATUS_MAP:
-        if any(kw in text for kw in keywords):
-            return status
-    return None
-
-
-_REJECT_SIGNALS = [
-    "regret to inform you",
-    "regret to let you know",
-    "decided not to move forward",
-    "decision to not move forward",
-    "decision not to move forward",
-    "not moving forward with your",
-    "will not be moving forward",
-    "decided to proceed with other candidates",
-    "decided to move forward with other",
-    "decided to move forward with candidates",
-    "chosen to move forward with other",
-    "moving forward with other candidates",
-    "move forward with other applicants",
-    "pursue other candidates",
-    "pursuing other candidates",
-    "not selected for this position",
-    "not selected for this role",
-    "not selected for an interview",
-    "not a fit for this role",
-    "not a fit for this position",
-    "have decided not to",
-    "chosen not to move forward",
-    "not be moving forward with your candidacy",
-]
-
-def _is_application_confirmation(subject, body):
-    """True if this email is an application-received confirmation.
-
-    Uses subject line first (most reliable) then body, stripping out
-    boilerplate conditional phrases like 'if you are not selected…'
-    that would otherwise trigger false rejection matches.
-    """
-    body_l = body.lower()
-    # Strip conditional/hypothetical negatives before any signal checks
-    body_clean = re.sub(
-        r'\bif\b[^.!?\n]*\b(?:not selected|not a match|not moving|no longer consider)\b[^.!?\n]*',
-        '', body_l
-    )
-    # Direct rejection signals — checked against cleaned body
-    if any(sig in body_clean for sig in _REJECT_SIGNALS):
-        return False
-    subj_l = subject.lower()
-    if any(kw in subj_l for kw in _CONFIRM_SUBJ_KWS):
-        return True
-    return any(kw in body_clean for kw in _CONFIRM_BODY_KWS)
 
 
 def _match_company(sender, subject, companies, body=""):
@@ -561,15 +681,23 @@ def _match_company(sender, subject, companies, body=""):
             if rec and "@" in rec and rec.split("@")[1] == domain:
                 return row[1]
 
-    # Company name word-boundary match in subject line
-    for row in companies:
+    # Company name word-boundary match in subject line (longest names first to avoid partial matches)
+    for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
         name_l = row[1].lower()
-        if re.search(r'\b' + re.escape(name_l) + r'\b', subj_l):
-            return row[1]
+        m = re.search(r'\b' + re.escape(name_l) + r'\b', subj_l)
+        if not m:
+            continue
+        # If single-word company name, skip if it appears inside a larger capitalized company name
+        # e.g. "Runway" should not match in "...application to Rent the Runway"
+        if len(row[1].split()) == 1:
+            pre = subject[:m.start()]
+            if re.search(r'[A-Z][A-Za-z]+\s+(?:the\s+|a\s+|an\s+|of\s+|&\s+)?$', pre):
+                continue
+        return row[1]
 
-    # For ATS senders: fall back to searching company name in email body (case-sensitive)
+    # For ATS senders: fall back to searching company name in email body (case-sensitive, longest first)
     if is_ats and body:
-        for row in companies:
+        for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
             if re.search(r'\b' + re.escape(row[1]) + r'\b', body):
                 return row[1]
 
@@ -654,14 +782,77 @@ def _extract_company_from_subject(subject):
     return None
 
 
+def _normalize_title(title) -> str | None:
+    """Lowercase, strip punctuation (keep word chars + spaces), collapse whitespace."""
+    if not title:
+        return None
+    t = re.sub(r"[^\w\s]", " ", title.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if t else None
+
+
+_ROLE_FAMILY_MAP = [
+    ("Engineering",        ["engineer", "developer", "swe", "software", "backend", "frontend", "devops", "platform"]),
+    ("Data·ML",            ["data", "machine learning", "ml", "analyst", "scientist", "ai", "nlp", "llm"]),
+    ("Product",            ["product manager", "product management", "pm", "product owner"]),
+    ("Design",             ["design", "ux", "ui", "user experience"]),
+    ("Program Management", ["program manager", "tpm", "technical program", "project manager"]),
+]
+
+def _role_family(title) -> str:
+    """Map a job title to a role family bucket."""
+    if not title:
+        return "Other"
+    t = title.lower()
+    for family, keywords in _ROLE_FAMILY_MAP:
+        if any(kw in t for kw in keywords):
+            return family
+    return "Other"
+
+
+def _age_bucket(days) -> str:
+    """Bucket age in days into one of four ranges."""
+    if days is None:
+        return "Unknown"
+    if days <= 7:
+        return "0–7d"
+    if days <= 14:
+        return "8–14d"
+    if days <= 30:
+        return "15–30d"
+    return "30d+"
+
+
+
 _JOB_TITLE_PATTERNS = [
     # "applying to the [Title] position/role"
-    r"appl(?:ying|ied|ication)\s+(?:to\s+)?(?:for\s+)?the\s+(.+?)\s+(?:position|role|opening|opportunity)\b",
+    # [^.!?\n] prevents crossing sentence boundaries
+    r"appl(?:ying|ied|ication)\s+(?:to\s+)?(?:for\s+)?the\s+([^.!?\n]{3,80}?)\s+(?:position|role|opening|opportunity)\b",
     # "for the [Title] position/role"
-    r"\bfor\s+the\s+(.+?)\s+(?:position|role|opening)\b",
+    r"\bfor\s+the\s+([^.!?\n]{3,80}?)\s+(?:position|role|opening)\b",
     # "interest in the [Title] role"
-    r"\binterest\s+in\s+the\s+(.+?)\s+(?:position|role|opening)\b",
+    r"\binterest\s+in\s+the\s+([^.!?\n]{3,80}?)\s+(?:position|role|opening)\b",
 ]
+
+_TITLE_JUNK_WORDS = {
+    "following", "this", "the", "that", "your", "our", "next", "any",
+    "each", "a", "an", "another", "said", "aforementioned",
+}
+
+def _is_valid_job_title(title):
+    """Return False for obvious non-titles (sentence fragments, generic words)."""
+    # Sentence fragment: contains a period with text after it
+    if re.search(r'\.\s*\S', title):
+        return False
+    # Single generic word
+    words = title.split()
+    if len(words) == 1 and title.lower() in _TITLE_JUNK_WORDS:
+        return False
+    # Must start with a capital letter or digit
+    if title and not (title[0].isupper() or title[0].isdigit()):
+        return False
+    return True
+
 
 def _extract_job_title(subject, body=""):
     """Try to extract a job title from subject then first 15 body lines."""
@@ -673,9 +864,54 @@ def _extract_job_title(subject, body=""):
             m = re.search(pat, text, re.IGNORECASE)
             if m:
                 title = m.group(1).strip().rstrip(".,- ")
-                if 3 < len(title) < 120:
+                if 3 < len(title) < 120 and _is_valid_job_title(title):
                     return title
     return None
+
+
+def _match_application_for_email(company_name, subject, body):
+    """Find the specific application row for a decision email.
+    
+    Returns (application_id, match_method).
+    """
+    with get_conn() as conn:
+        open_apps = conn.execute(
+            "SELECT id, job_title, job_title_normalized FROM applications "
+            "WHERE LOWER(company_name)=LOWER(?) AND decision_date IS NULL",
+            (company_name,),
+        ).fetchall()
+
+    if not open_apps:
+        return (None, "no_apps")
+
+    if len(open_apps) == 1:
+        return (open_apps[0][0], "company_only_single")
+
+    # Multiple open apps — try to match by title
+    email_title_raw = _extract_job_title(subject, body)
+    email_title_norm = _normalize_title(email_title_raw)
+
+    if email_title_norm:
+        # Exact match
+        for app_id, _, app_title_norm in open_apps:
+            if app_title_norm and app_title_norm == email_title_norm:
+                return (app_id, "company_title_exact")
+
+        # Fuzzy match
+        best_ratio  = 0.0
+        best_app_id = None
+        for app_id, _, app_title_norm in open_apps:
+            if not app_title_norm:
+                continue
+            ratio = SequenceMatcher(None, email_title_norm, app_title_norm).ratio()
+            if ratio > best_ratio:
+                best_ratio  = ratio
+                best_app_id = app_id
+        if best_ratio >= 0.75 and best_app_id is not None:
+            return (best_app_id, "company_title_fuzzy")
+
+    return (None, "unmatched_ambiguous")
+
 
 
 def _should_update(current, new):
@@ -720,8 +956,9 @@ def run_gmail_sync(days=90):
     tracked_names = {r[1].lower() for r in companies}
 
     # Gmail returns newest first — keep only the most recent email per company
-    best     = {}   # company_lower → entry (tracked companies)
-    best_new = {}   # name_lower    → entry (companies not yet in tracker)
+    best            = {}   # company_lower → entry (tracked companies, confirmations)
+    best_new        = {}   # name_lower    → entry (companies not yet in tracker)
+    best_rejections = {}   # company_lower → entry (tracked companies, rejections)
 
     for ref in msgs:
         try:
@@ -736,10 +973,6 @@ def run_gmail_sync(days=90):
         # Unwrap forwarded emails so we match on the original sender/subject
         subject, sender, body = _unwrap_forwarded(subject, sender, body)
 
-        # Only surface application-received emails
-        if not _is_application_confirmation(subject, body):
-            continue
-
         internal_ms = int(msg.get("internalDate", 0))
         email_date  = datetime.fromtimestamp(internal_ms / 1000).date() if internal_ms else date.today()
         new_age     = (date.today() - email_date).days
@@ -750,6 +983,57 @@ def run_gmail_sync(days=90):
         is_ats_sender  = any(d in sender_domain for d in ATS_DOMAINS)
 
         company = _match_company(sender, subject, companies, body)
+
+        result = classify_email(subject, body, sender)
+
+        # Match to specific application (for non-confirmation emails)
+        app_id, match_method = (None, "no_apps")
+        if company and result.label != "confirmation":
+            app_id, match_method = _match_application_for_email(company, subject, body)
+
+        # Persist classification (best-effort)
+        try:
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO email_classifications "
+                    "(gmail_msg_id, gmail_thread_id, email_date, sender, subject, "
+                    " label, confidence, evidence, application_id, match_method) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (ref["id"], msg.get("threadId"), email_date.isoformat(),
+                     sender, subject, result.label, result.confidence,
+                     json.dumps(result.evidence), app_id, match_method),
+                )
+        except Exception:
+            pass
+
+        if company and result.legacy_status in ("Rejected", "Interviewing", "Offer"):
+            update_application_decision(company, result.legacy_status, email_date.isoformat(),
+                                        application_id=app_id, gmail_msg_id=ref["id"])
+
+        # Collect rejection emails for the Rejections tab (one per company, most recent)
+        if result.label == "rejection" and company:
+            rej_key = company.lower()
+            if rej_key not in best_rejections:
+                company_row = next((r for r in companies if r[1].lower() == rej_key), None)
+                best_rejections[rej_key] = {
+                    "type": "rejection",
+                    "company": company,
+                    "subject": subject,
+                    "sender": sender,
+                    "body": body,
+                    "last_checked": company_row[2] if company_row else None,
+                    "last_applied": company_row[7] if company_row else None,
+                    "email_date": email_date.isoformat(),
+                    "new_age": new_age,
+                    "msg_id": ref["id"],
+                    "thread_id": msg.get("threadId"),
+                    "confidence": result.confidence,
+                    "evidence": result.evidence,
+                }
+
+        # Only surface application-received emails in the applied sync log
+        if result.label != "confirmation":
+            continue
+
         if company:
             key = company.lower()
             company_row  = next((r for r in companies if r[1].lower() == key), None)
@@ -765,7 +1049,7 @@ def run_gmail_sync(days=90):
 
             # Auto-log job title to applications table (runs for every confirmation email found)
             log_application(company, _extract_job_title(subject, body),
-                            email_date.isoformat(), subject)
+                            email_date.isoformat(), subject, gmail_msg_id=ref["id"])
 
             if key not in best:
                 last_checked  = company_row[2] if company_row else None
@@ -821,10 +1105,10 @@ def run_gmail_sync(days=90):
                         "msg_id": ref["id"], "thread_id": msg.get("threadId"),
                     }
 
-    if not best and not best_new:
-        return [{"type": "info", "message": "No application confirmation emails found."}]
+    if not best and not best_new and not best_rejections:
+        return [{"type": "info", "message": "No application emails found."}]
 
-    return list(best.values()) + list(best_new.values())
+    return list(best.values()) + list(best_new.values()) + list(best_rejections.values())
 
 
 def mark_company_rejected(company):
@@ -935,17 +1219,18 @@ def render_companies_tab():
                 f'</div>'
             )
             note_html = f'<span class="note-text">{notes}</span>' if notes else '<span style="color:#bdc1c6">—</span>'
-            link_html = (
-                f'<a class="careers-link" href="{careers_url}" target="_blank">↗ Careers</a>'
-                if careers_url else
-                '<span style="color:#bdc1c6;font-size:0.82rem">—</span>'
-            )
-
             c = st.columns(COLS)
             c[0].markdown(name_html, unsafe_allow_html=True)
             c[1].markdown(date_html, unsafe_allow_html=True)
             c[2].markdown(age_html,  unsafe_allow_html=True)
-            c[3].markdown(link_html, unsafe_allow_html=True)
+            if careers_url:
+                clnk, cclr = c[3].columns([5, 1])
+                clnk.markdown(f'<a class="careers-link" href="{careers_url}" target="_blank">↗ Careers</a>', unsafe_allow_html=True)
+                if cclr.button("✕", key=f"clr_{cid}", help="Clear careers URL"):
+                    update_company(cid, notes or "", "", recruiting_email or "")
+                    st.rerun()
+            else:
+                c[3].markdown('<span style="color:#bdc1c6;font-size:0.82rem">—</span>', unsafe_allow_html=True)
 
             app_col, chk_col = c[4].columns(2)
             if app_col.button("✓ Applied", key=f"app_{cid}", type="primary"):
@@ -1114,7 +1399,7 @@ def render_gmail_tab():
         st.session_state["gmail_rejected"]  = set()
         st.session_state["gmail_undo"]      = {}
         for k in list(st.session_state.keys()):
-            if k.startswith("new_sel_"):
+            if k.startswith("new_sel_") or k.startswith("chg_sel_"):
                 del st.session_state[k]
         st.rerun()
 
@@ -1158,7 +1443,15 @@ def render_gmail_tab():
         valid = [a for a in ages if a is not None]
         return min(valid) if valid else None
 
-    def _render_item(i, e, key_prefix, already_uptodate=False):
+    def _trash_e(ev):
+        thread_id = ev.get("thread_id")
+        msg_id = ev.get("msg_id")
+        if thread_id:
+            trash_gmail_thread(thread_id)
+        elif msg_id:
+            trash_gmail_message(msg_id)
+
+    def _render_item(i, e, key_prefix, already_uptodate=False, show_checkbox=False):
         current_age = _most_recent_age(e)
         new_age     = e.get("new_age")
         age_html    = f'{_age_badge(current_age)} → {_age_badge(new_age)}'
@@ -1200,19 +1493,18 @@ def render_gmail_tab():
                 unsafe_allow_html=True,
             )
         else:
-            def _trash_thread(e):
-                thread_id = e.get("thread_id")
-                msg_id = e.get("msg_id")
-                if thread_id:
-                    trash_gmail_thread(thread_id)
-                elif msg_id:
-                    trash_gmail_message(msg_id)
-
+            use_cb = show_checkbox and not already_uptodate
             if already_uptodate:
                 row = st.columns([3.5, 1.0, 0.9, 1.3, 0.8])
+            elif use_cb:
+                row = st.columns([0.35, 2.65, 1.2, 1.5, 0.9, 1.3, 0.8])
             else:
                 row = st.columns([3.0, 1.2, 1.5, 0.9, 1.3, 0.8])
-            row[0].markdown(
+            ci = 0
+            if use_cb:
+                row[0].checkbox("", key=f"chg_sel_{i}", label_visibility="collapsed")
+                ci = 1
+            row[ci].markdown(
                 f'<span class="company-name">{e["company"]}</span>'
                 f'&nbsp;{age_html}'
                 f'<br><span style="color:#9ca3af;font-size:0.78rem">{e["subject"]}</span>'
@@ -1220,70 +1512,70 @@ def render_gmail_tab():
                 unsafe_allow_html=True,
             )
             if already_uptodate:
-                if row[1].button("🗑 Delete", key=f"{key_prefix}_trash_{i}"):
+                if row[ci+1].button("🗑 Delete", key=f"{key_prefix}_trash_{i}"):
                     try:
-                        _trash_thread(e)
+                        _trash_e(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
-                if row[2].button("Reject", key=f"{key_prefix}_reject_{i}"):
+                if row[ci+2].button("Reject", key=f"{key_prefix}_reject_{i}"):
                     mark_company_rejected(e["company"])
                     rejected.add(i)
                     st.session_state["gmail_rejected"] = rejected
                     st.rerun()
-                if row[3].button("Reject & 🗑", key=f"{key_prefix}_reject_del_{i}"):
+                if row[ci+3].button("Reject & 🗑", key=f"{key_prefix}_reject_del_{i}"):
                     mark_company_rejected(e["company"])
                     rejected.add(i)
                     st.session_state["gmail_rejected"] = rejected
                     try:
-                        _trash_thread(e)
+                        _trash_e(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
-                if row[4].button("Dismiss", key=f"{key_prefix}_dismiss_{i}"):
+                if row[ci+4].button("Dismiss", key=f"{key_prefix}_dismiss_{i}"):
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
             else:
-                if row[1].button("Update Tracker", key=f"{key_prefix}_apply_{i}", type="primary"):
+                if row[ci+1].button("Update Tracker", key=f"{key_prefix}_apply_{i}", type="primary"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
-                if row[2].button("Update & 🗑", key=f"{key_prefix}_apply_del_{i}"):
+                if row[ci+2].button("Update & 🗑", key=f"{key_prefix}_apply_del_{i}"):
                     undo_data[i] = {"company": e["company"], "old_applied": e.get("last_applied")}
                     apply_gmail_match(e["company"], e["email_date"])
                     try:
-                        _trash_thread(e)
+                        _trash_e(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     updated.add(i)
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
-                if row[3].button("Reject", key=f"{key_prefix}_reject_{i}"):
+                if row[ci+3].button("Reject", key=f"{key_prefix}_reject_{i}"):
                     mark_company_rejected(e["company"])
                     rejected.add(i)
                     st.session_state["gmail_rejected"] = rejected
                     st.rerun()
-                if row[4].button("Reject & 🗑", key=f"{key_prefix}_reject_del_{i}"):
+                if row[ci+4].button("Reject & 🗑", key=f"{key_prefix}_reject_del_{i}"):
                     mark_company_rejected(e["company"])
                     rejected.add(i)
                     st.session_state["gmail_rejected"] = rejected
                     try:
-                        _trash_thread(e)
+                        _trash_e(e)
                     except Exception as ex:
                         st.error(f"Failed to delete: {ex}")
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
-                if row[5].button("Dismiss", key=f"{key_prefix}_dismiss_{i}"):
+                if row[ci+5].button("Dismiss", key=f"{key_prefix}_dismiss_{i}"):
                     dismissed.add(i)
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
@@ -1322,15 +1614,63 @@ def render_gmail_tab():
 
     # ── Tracked companies with a different age ──
     if changed:
+        chg_action  = [(i, e) for i, e in changed if i not in updated and i not in rejected]
+        chg_sel_ids = [i for i, _ in chg_action if st.session_state.get(f"chg_sel_{i}", False)]
+        n_chg_sel   = len(chg_sel_ids)
+        n_chg_total = len(chg_action)
+
+        n_pending = sum(1 for i, _ in changed if i not in updated and i not in rejected)
+        n_done    = sum(1 for i, _ in changed if i in updated)
         parts = []
-        pending = sum(1 for i, _ in changed if i not in updated)
-        done    = sum(1 for i, _ in changed if i in updated)
-        if pending: parts.append(f"**{pending}** to review")
-        if done:    parts.append(f"**{done}** updated")
-        if parts:   st.markdown(" · ".join(parts))
+        if n_pending: parts.append(f"**{n_pending}** to review")
+        if n_done:    parts.append(f"**{n_done}** updated")
+
+        hc1, hc2 = st.columns([3.5, 1.0])
+        if parts: hc1.markdown(" · ".join(parts))
+        if chg_action:
+            sel_label = "Deselect All" if n_chg_sel == n_chg_total else "Select All"
+            if hc2.button(sel_label, key="chg_sel_all_btn"):
+                new_val = n_chg_sel < n_chg_total
+                for i, _ in chg_action:
+                    st.session_state[f"chg_sel_{i}"] = new_val
+                st.rerun()
+
+        if n_chg_sel > 0:
+            bc1, bc2, bc3, _ = st.columns([1.4, 1.6, 1.1, 2.5])
+            if bc1.button(f"Update {n_chg_sel}", type="primary", key="chg_bulk_update"):
+                for bi in chg_sel_ids:
+                    be = next(e for j, e in chg_action if j == bi)
+                    undo_data[bi] = {"company": be["company"], "old_applied": be.get("last_applied")}
+                    apply_gmail_match(be["company"], be["email_date"])
+                    updated.add(bi)
+                    st.session_state.pop(f"chg_sel_{bi}", None)
+                st.session_state["gmail_updated"] = updated
+                st.session_state["gmail_undo"]    = undo_data
+                st.rerun()
+            if bc2.button(f"Update & 🗑 {n_chg_sel}", key="chg_bulk_update_del"):
+                for bi in chg_sel_ids:
+                    be = next(e for j, e in chg_action if j == bi)
+                    undo_data[bi] = {"company": be["company"], "old_applied": be.get("last_applied")}
+                    apply_gmail_match(be["company"], be["email_date"])
+                    try:
+                        _trash_e(be)
+                    except Exception:
+                        pass
+                    updated.add(bi)
+                    st.session_state.pop(f"chg_sel_{bi}", None)
+                st.session_state["gmail_updated"] = updated
+                st.session_state["gmail_undo"]    = undo_data
+                st.rerun()
+            if bc3.button(f"Dismiss {n_chg_sel}", key="chg_bulk_dismiss"):
+                for bi in chg_sel_ids:
+                    dismissed.add(bi)
+                    st.session_state.pop(f"chg_sel_{bi}", None)
+                st.session_state["gmail_dismissed"] = dismissed
+                st.rerun()
+
         st.markdown("")
         for i, e in changed:
-            _render_item(i, e, "main")
+            _render_item(i, e, "main", show_checkbox=True)
     elif not new_vis and not errors and not infos:
         st.info("No new changes — all matched companies are already up to date.")
 
@@ -1639,85 +1979,291 @@ def render_jobs_tab():
 
 def render_stats_tab():
     st.subheader("Application Stats")
-    st.caption("🧪 Beta · Based on confirmation emails logged via Gmail Sync")
 
     with get_conn() as conn:
-        apps = conn.execute(
-            "SELECT company_name, job_title, applied_date FROM applications ORDER BY applied_date DESC"
+        apps_raw = conn.execute(
+            "SELECT company_name, job_title, applied_date, rejected_at "
+            "FROM applications WHERE applied_date IS NOT NULL ORDER BY applied_date DESC"
         ).fetchall()
 
-    if not apps:
+    if not apps_raw:
         st.info("No data yet — run Gmail Sync on tracked companies to populate this tab.")
         return
 
-    df = pd.DataFrame(apps, columns=["company", "job_title", "applied_date"])
+    df = pd.DataFrame(apps_raw, columns=["company", "job_title", "applied_date", "rejected_at"])
     df["applied_date"] = pd.to_datetime(df["applied_date"], errors="coerce")
+    df["rejected_at"]  = pd.to_datetime(df["rejected_at"],  errors="coerce")
     df = df.dropna(subset=["applied_date"])
-
-    if df.empty:
-        st.info("No dated application records found.")
-        return
 
     today    = pd.Timestamp.today().normalize()
     df["days_ago"] = (today - df["applied_date"]).dt.days
 
-    # ── Overview metrics ──
-    total      = len(df)
-    unique_cos = df["company"].nunique()
-    last7      = int((df["days_ago"] <= 7).sum())
-    last30     = int((df["days_ago"] <= 30).sum())
+    total    = len(df)
+    active   = int(df["rejected_at"].isna().sum())
+    rej_df   = df.dropna(subset=["rejected_at"]).copy()
+    rej_df["days_to_reject"] = (rej_df["rejected_at"] - rej_df["applied_date"]).dt.days.clip(lower=0)
 
-    c1, c2, c3, c4 = st.columns(4)
+    # ── Summary cards ──
+    c1, c2, c3 = st.columns(3)
     c1.metric("Total Applications", total)
-    c2.metric("Unique Companies",   unique_cos)
-    c3.metric("Last 7 Days",        last7)
-    c4.metric("Last 30 Days",       last30)
+    c2.metric("Active",             active)
+    c3.metric("Rejected",           len(rej_df))
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # ── Time-to-rejection metrics ──
+    if not rej_df.empty:
+        st.markdown("")
+        avg_rej = rej_df["days_to_reject"].mean()
+        med_rej = rej_df["days_to_reject"].median()
+        pct_3d  = (rej_df["days_to_reject"] <= 3).mean()
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Avg days to rejection",    f"{avg_rej:.0f}d")
+        t2.metric("Median days to rejection", f"{med_rej:.0f}d")
+        t3.metric("Rejected within 3 days",   f"{pct_3d:.0%}",
+                  help="High % may indicate ATS/resume screening rather than manual review")
 
-    # ── Weekly activity chart (last 12 weeks) ──
-    st.markdown("**Applications per week — last 12 weeks**")
+    st.markdown("---")
+
+    # ── Weekly chart: applications + rejections (last 12 weeks) ──
     df12 = df[df["days_ago"] <= 84].copy()
     if not df12.empty:
+        st.markdown("**Last 12 weeks**")
         df12["week"] = df12["applied_date"].dt.to_period("W").apply(lambda p: p.start_time)
-        weekly = df12.groupby("week").size().rename("Applications")
-        st.bar_chart(weekly)
-    else:
-        st.caption("No applications in the last 12 weeks.")
+        weekly_apps = df12.groupby("week").size().rename("Applications")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Top companies & titles ──
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**Top companies**")
-        top_cos = df.groupby("company").size().sort_values(ascending=False).head(10)
-        rows = [f"| {co} | {cnt} |" for co, cnt in top_cos.items()]
-        st.markdown("| Company | Apps |\n|---|---|\n" + "\n".join(rows))
-
-    with col2:
-        st.markdown("**Top job titles**")
-        titles = df["job_title"].dropna()
-        if not titles.empty:
-            top_t = titles.value_counts().head(10)
-            rows = [f"| {t} | {cnt} |" for t, cnt in top_t.items()]
-            st.markdown("| Title | Count |\n|---|---|\n" + "\n".join(rows))
+        # Rejections bucketed by rejection date (not applied date)
+        rej12 = rej_df[rej_df["rejected_at"] >= (today - pd.Timedelta(weeks=12))].copy()
+        if not rej12.empty:
+            rej12["week"] = rej12["rejected_at"].dt.to_period("W").apply(lambda p: p.start_time)
+            weekly_rej = rej12.groupby("week").size().rename("Rejections")
         else:
-            st.caption("No job titles extracted yet. They'll appear after future syncs.")
+            weekly_rej = pd.Series(dtype=int, name="Rejections")
 
-    # ── Cadence ──
+        weekly = pd.concat([weekly_apps, weekly_rej], axis=1).fillna(0).astype(int)
+        st.bar_chart(weekly)
+
+    st.markdown("")
+
+    # ── Velocity ──
+    last7   = int((df["days_ago"] <= 7).sum())
+    v1, v2  = st.columns(2)
+    v1.metric("Applied last 7 days", last7)
     sorted_dates = df["applied_date"].sort_values()
     if len(sorted_dates) > 1:
-        st.markdown("<br>", unsafe_allow_html=True)
-        gaps     = sorted_dates.diff().dt.days.dropna()
-        avg_gap  = gaps.mean()
-        med_gap  = gaps.median()
-        busiest  = df.groupby("company").size().idxmax()
-        g1, g2, g3 = st.columns(3)
-        g1.metric("Avg. days between apps", f"{avg_gap:.1f}d")
-        g2.metric("Median gap",             f"{med_gap:.1f}d")
-        g3.metric("Most applied to",        busiest)
+        avg_gap = sorted_dates.diff().dt.days.dropna().mean()
+        v2.metric("Avg days between apps", f"{avg_gap:.1f}d")
+
+    st.markdown("---")
+
+    # ── Pipeline aging (active apps only) ──
+    active_df = df[df["rejected_at"].isna()].copy()
+    if not active_df.empty:
+        st.markdown("**Active pipeline**")
+
+        def _simple_bucket(d):
+            if d <= 7:  return "0–7d"
+            if d <= 14: return "7–14d"
+            return "14+d"
+
+        active_df["Bucket"] = active_df["days_ago"].apply(_simple_bucket)
+        bucket_order  = ["0–7d", "7–14d", "14+d"]
+        bucket_counts = active_df["Bucket"].value_counts().reindex(bucket_order, fill_value=0)
+        st.bar_chart(bucket_counts.rename("Active Applications"))
+
+
+
+def _age_badge_html(d):
+    """Return an HTML badge for an age in days (module-level, used by multiple tabs)."""
+    if d is None:
+        return '<span class="badge" style="background:#d1d5db;color:#6b7280">never</span>'
+    return f'<span class="badge" style="background:{staleness_color(d)}">{d}d</span>'
+
+
+def _trash_email_entry(e):
+    """Trash a Gmail email entry dict (trashes by thread, falls back to message)."""
+    thread_id = e.get("thread_id")
+    msg_id    = e.get("msg_id")
+    if thread_id:
+        trash_gmail_thread(thread_id)
+    elif msg_id:
+        trash_gmail_message(msg_id)
+
+
+def render_rejections_tab():
+    st.subheader("Rejection Sync")
+    st.markdown(
+        '<p style="color:#6b7280;font-size:0.9rem;margin-bottom:1rem">'
+        "Rejection emails found during your last Gmail sync. "
+        "Click <b>Update Tracker</b> to mark matching job postings as Rejected.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if not GMAIL_AVAILABLE:
+        st.error("Google API libraries are not installed.")
+        st.code("pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+        return
+
+    if not os.path.exists(CREDENTIALS_FILE):
+        st.warning(f"`{CREDENTIALS_FILE}` not found. Complete Gmail setup on the ⚙️ Setup tab first.")
+        return
+
+    # ── Controls ──
+    c1, c2, c3 = st.columns([1.3, 1.0, 1])
+    sync_days = c3.number_input("Days to scan", min_value=1, value=90, step=1, key="rej_days")
+    if c1.button("🔄  Sync Gmail", type="primary", key="rej_sync_btn"):
+        with st.spinner("Syncing…  (a browser window may open for first-time authorization)"):
+            log = run_gmail_sync(days=sync_days)
+        st.session_state["gmail_log"]     = log
+        st.session_state["gmail_synced"]  = datetime.now().strftime("%b %d %Y · %I:%M %p")
+        st.session_state["rej_updated"]   = set()
+        st.session_state["rej_dismissed"] = set()
+        for k in list(st.session_state.keys()):
+            if k.startswith("rej_sel_"):
+                del st.session_state[k]
+        st.rerun()
+
+    if os.path.exists(TOKEN_FILE) and c2.button("Disconnect Gmail", key="rej_disconnect_btn"):
+        os.remove(TOKEN_FILE)
+        for k in ("gmail_log", "gmail_synced"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    if "gmail_synced" in st.session_state:
+        st.caption(f"Last synced: {st.session_state['gmail_synced']}")
+
+    if "gmail_log" not in st.session_state:
+        return
+
+    log           = st.session_state["gmail_log"]
+    rej_updated   = st.session_state.get("rej_updated",   set())
+    rej_dismissed = st.session_state.get("rej_dismissed", set())
+
+    all_items = [(i, e) for i, e in enumerate(log) if e.get("type") == "rejection"]
+    visible   = [(i, e) for i, e in all_items if i not in rej_dismissed]
+
+    st.markdown("---")
+
+    if not visible:
+        has_synced = bool(all_items) or any(e.get("type") != "rejection" for e in log)
+        if has_synced:
+            st.info("No rejection emails found in the last sync.")
+        else:
+            st.info("Run a sync to check for rejection emails.")
+        return
+
+    # ── Header + Select All ──
+    action_vis = [(i, e) for i, e in visible if i not in rej_updated]
+    sel_ids    = [i for i, _ in action_vis if st.session_state.get(f"rej_sel_{i}", False)]
+    n_pending  = len(action_vis)
+    n_done     = sum(1 for i, _ in visible if i in rej_updated)
+
+    parts = []
+    if n_pending: parts.append(f"**{n_pending}** to review")
+    if n_done:    parts.append(f"**{n_done}** updated")
+
+    hc1, hc2 = st.columns([3.5, 1.0])
+    if parts: hc1.markdown(" · ".join(parts))
+    if action_vis:
+        sel_label = "Deselect All" if len(sel_ids) == n_pending else "Select All"
+        if hc2.button(sel_label, key="rej_sel_all_btn"):
+            new_val = len(sel_ids) < n_pending
+            for i, _ in action_vis:
+                st.session_state[f"rej_sel_{i}"] = new_val
+            st.rerun()
+
+    # ── Bulk action bar ──
+    if sel_ids:
+        bc1, bc2, bc3, _ = st.columns([1.5, 1.8, 1.1, 2.0])
+        if bc1.button(f"Update {len(sel_ids)}", type="primary", key="rej_bulk_update"):
+            for bi in sel_ids:
+                be = next(e for j, e in action_vis if j == bi)
+                mark_company_rejected(be["company"])
+                rej_updated.add(bi)
+                st.session_state.pop(f"rej_sel_{bi}", None)
+            st.session_state["rej_updated"] = rej_updated
+            st.rerun()
+        if bc2.button(f"Update & 🗑 {len(sel_ids)}", key="rej_bulk_update_del"):
+            for bi in sel_ids:
+                be = next(e for j, e in action_vis if j == bi)
+                mark_company_rejected(be["company"])
+                try:
+                    _trash_email_entry(be)
+                except Exception:
+                    pass
+                rej_updated.add(bi)
+                st.session_state.pop(f"rej_sel_{bi}", None)
+            st.session_state["rej_updated"] = rej_updated
+            st.rerun()
+        if bc3.button(f"Dismiss {len(sel_ids)}", key="rej_bulk_dismiss"):
+            for bi in sel_ids:
+                rej_dismissed.add(bi)
+                st.session_state.pop(f"rej_sel_{bi}", None)
+            st.session_state["rej_dismissed"] = rej_dismissed
+            st.rerun()
+
+    st.markdown("")
+
+    # ── Per-item rows ──
+    for i, e in visible:
+        company    = e["company"]
+        age_badge  = _age_badge_html(e.get("new_age"))
+        confidence = e.get("confidence", 0.0)
+        evidence   = e.get("evidence", [])
+
+        _, sender_addr = parseaddr(e.get("sender", ""))
+        sender_html = (
+            f'<span style="color:#6b7280;font-size:0.78rem">{sender_addr}</span>'
+            if sender_addr else ""
+        )
+
+        if i in rej_updated:
+            st.markdown(
+                f'❌ &nbsp;<span class="company-name">{company}</span>'
+                f'&nbsp;{age_badge}&nbsp;'
+                f'<span style="color:#dc2626;font-size:0.82rem">marked rejected</span>'
+                f'<br><span style="color:#9ca3af;font-size:0.78rem;padding-left:1.4rem">'
+                f'{e.get("subject", "")}</span>'
+                f'<br><span style="padding-left:1.4rem">{sender_html}</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            row = st.columns([0.35, 3.0, 1.5, 1.8, 0.9])
+            row[0].checkbox("", key=f"rej_sel_{i}", label_visibility="collapsed")
+            row[1].markdown(
+                f'<span class="company-name">{company}</span>'
+                f'&nbsp;{age_badge}'
+                f'<br><span style="color:#9ca3af;font-size:0.78rem">{e.get("subject", "")}</span>'
+                f'<br>{sender_html}',
+                unsafe_allow_html=True,
+            )
+            if row[2].button("Update Tracker", key=f"rej_apply_{i}", type="primary"):
+                mark_company_rejected(company)
+                rej_updated.add(i)
+                st.session_state["rej_updated"] = rej_updated
+                st.rerun()
+            if row[3].button("Update & 🗑", key=f"rej_apply_del_{i}"):
+                mark_company_rejected(company)
+                try:
+                    _trash_email_entry(e)
+                except Exception as ex:
+                    st.error(f"Failed to delete: {ex}")
+                rej_updated.add(i)
+                st.session_state["rej_updated"] = rej_updated
+                st.rerun()
+            if row[4].button("Dismiss", key=f"rej_dismiss_{i}"):
+                rej_dismissed.add(i)
+                st.session_state["rej_dismissed"] = rej_dismissed
+                st.rerun()
+
+        # Confidence + matched phrases
+        if evidence:
+            ev_str = ", ".join(f'"{p}"' for p in evidence[:4])
+            extra  = f" (+{len(evidence) - 4} more)" if len(evidence) > 4 else ""
+            st.caption(f"Confidence {confidence:.0%} · Matched: {ev_str}{extra}")
+
+        body_text = (e.get("body") or "").strip()
+        if body_text:
+            with st.expander("View email body"):
+                st.text(body_text)
 
 
 def render_setup_tab():
@@ -1783,8 +2329,9 @@ def main():
     st.caption(f"Today · {date.today().strftime('%B %d, %Y')}")
     st.markdown("<br>", unsafe_allow_html=True)
 
-    tab_view, tab_add, tab_jobs, tab_stats, tab_gmail, tab_setup = st.tabs([
-        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📊  Stats", "📧  Gmail Sync", "⚙️  Gmail Setup",
+    tab_view, tab_add, tab_jobs, tab_stats, tab_gmail, tab_reject, tab_setup = st.tabs([
+        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📊  Stats",
+        "📧  Gmail Sync", "❌  Rejections", "⚙️  Gmail Setup",
     ])
 
     with tab_view:
@@ -1801,6 +2348,9 @@ def main():
 
     with tab_gmail:
         render_gmail_tab()
+
+    with tab_reject:
+        render_rejections_tab()
 
     with tab_setup:
         render_setup_tab()
