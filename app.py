@@ -695,6 +695,16 @@ def _match_company(sender, subject, companies, body=""):
                 continue
         return row[1]
 
+    # For ATS senders: match local part of email address against company slug first
+    # e.g. zillow@myworkday.com → "zillow" → matches "Zillow" before body scan finds "Workday"
+    if is_ats and "@" in addr_l:
+        local = addr_l.split("@")[0]
+        if local:
+            for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
+                slug = row[1].lower().replace(" ", "").replace("-", "")
+                if local == slug:
+                    return row[1]
+
     # For ATS senders: fall back to searching company name in email body (case-sensitive, longest first)
     if is_ats and body:
         for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):

@@ -480,3 +480,94 @@ def test_40_curly_apostrophe_normalization():
         sender=PLAIN_SENDER,
     )
     assert result.label == "rejection"
+
+
+def test_41_regression_veeva_decision_to_not_move_forward():
+    """Split-infinitive 'decision to not move forward' (Veeva/Lime) must be rejection."""
+    result = classify_email(
+        subject="Thank you for your interest in Veeva",
+        body=(
+            "Hi Hiral,\n\nThank you for your interest in Veeva and for giving us the opportunity "
+            "to review your application for the Product Manager - Vault CRM Suite position.\n\n"
+            "After reviewing your resume, we've made the decision to not move forward at this time.\n\n"
+            "We appreciate your interest in Veeva and wish you success in your job search.\n\n"
+            "Kind regards,\nVeeva Talent Attraction Team"
+        ),
+        sender="no-reply@hire.lever.co",
+    )
+    assert result.label == "rejection", (
+        f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_42_regression_rho_decided_to_move_forward_with_candidates():
+    """'decided to move forward with candidates whose experience' (Rho/Klaviyo) must be rejection."""
+    result = classify_email(
+        subject="Thank you for your interest in Rho",
+        body=(
+            "Hi Hiral,\n\nThank you for your interest in the Product Manager position at Rho.\n\n"
+            "Unfortunately, we have decided to move forward with candidates whose experience more "
+            "closely aligns with our team's current needs. While we won't be proceeding with your "
+            "candidacy at this time, we value the time and effort you invested in applying.\n\n"
+            "Rho Talent Acquisition Team"
+        ),
+        sender="no-reply@ashbyhq.com",
+    )
+    assert result.label == "rejection", (
+        f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_43_regression_gemini_concluding_search():
+    """'found a finalist / concluding our search' (Gemini) must be rejection."""
+    result = classify_email(
+        subject="Gemini | Application Update",
+        body=(
+            "Hi Hiral,\n\nThanks for applying to the Product Management Intern (Summer 2025) role "
+            "at Gemini. We really appreciate that you took the time to consider us.\n\n"
+            "While impressed with your experience, we have recently found a finalist for this "
+            "position and are concluding our search at this time.\n\n"
+            "Thank you again for your interest in Gemini. We wish you the best of luck.\n\nBest,\n"
+            "Grace Reginato\nTalent Acquisition Associate"
+        ),
+        sender="careers@gemini.com",
+    )
+    assert result.label == "rejection", (
+        f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_44_regression_spotify_not_selected_next_round():
+    """'resume was not selected for the next round' (Spotify) must be rejection."""
+    result = classify_email(
+        subject="Thanks for your interest in Spotify, Hiral",
+        body=(
+            "Hi Hiral,\n\nThank you for applying for the Fullstack/Backend Engineer position, "
+            "and for considering an opportunity with Spotify.\n\n"
+            "At this time and for this specific gig, your resume was not selected for the next round. "
+            "We're fortunate to receive a huge number of competitive applications.\n\n"
+            "Warm wishes,\nThe Spotify Recruiting Team"
+        ),
+        sender="no-reply@hire.lever.co",
+    )
+    assert result.label == "rejection", (
+        f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_45_regression_televisaunivision_no_longer_accepting_candidates():
+    """'no longer accepting candidates' (TelevisaUnivision) must be rejection."""
+    result = classify_email(
+        subject="Thank you for your interest",
+        body=(
+            "Dear HIRAL Thank you for your interest in employment with TelevisaUnivision. "
+            "We appreciate the time that you have invested in your job search for the position of: "
+            "Intern, Strategy & Insights. This position is no longer accepting candidates but we "
+            "thank you for your interest in TelevisaUnivision. We wish you continued success.\n\n"
+            "Sincerely,\nTelevisaUnivision Talent Acquisition Team"
+        ),
+        sender="univision@myworkday.com",
+    )
+    assert result.label == "rejection", (
+        f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )

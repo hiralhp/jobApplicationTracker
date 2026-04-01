@@ -29,6 +29,7 @@ INTERVIEW_PHRASES = [
 REJECTION_PHRASES = [
     ("regret to inform you", 10), ("regret to let you know", 10),
     ("decided not to move forward", 10), ("decision not to move forward", 10),
+    ("decision to not move forward", 10),  # split-infinitive variant (e.g. Veeva)
     ("not moving forward with your", 10), ("will not be moving forward", 10),
     ("decided to proceed with other candidates", 10),
     ("decided to move forward with other", 10),
@@ -56,6 +57,9 @@ REJECTION_PHRASES = [
     ("we have filled this position", 8), ("no longer accepting applications", 7),
     ("going in a different direction", 7), ("at this time we are unable", 7),
     ("not selected", 7), ("other candidates", 5), ("unfortunately", 3),
+    ("not selected for the next round", 10),  # Spotify: "your resume was not selected for the next round"
+    ("concluding our search", 9),             # Gemini: "are concluding our search at this time"
+    ("found a finalist", 8),                  # Gemini: "found a finalist for this position"
 ]
 
 CONFIRMATION_PHRASES = [
@@ -100,6 +104,12 @@ REJECTION_PATTERNS: list = [
     (_re.compile(r"\bother candidates? for this (?:role|position)\b"),                    8),
     # "unfortunately … not/unable/won't/will not" (within 80 chars)
     (_re.compile(r"\bunfortunately\b.{0,80}(?:\bnot\b|\bunable\b|\bwon.t\b|\bwill not\b)"), 7),
+    # "decided to move forward with candidates [whose/who/that]…" (Rho, Klaviyo)
+    (_re.compile(r"\bdecided to move forward with candidates\b"),                            10),
+    # "won't be proceeding with your" (Rho)
+    (_re.compile(r"\bwon't be proceeding with your\b"),                                       9),
+    # "no longer accepting candidates/applications/resumes" (TelevisaUnivision)
+    (_re.compile(r"\bno longer accepting (?:candidates|applications|resumes)\b"),             7),
 ]
 
 # Patterns unambiguous enough to override confirmation score entirely.
@@ -114,6 +124,12 @@ STRONG_REJECTION_PATTERNS: list = [
     _re.compile(r"\bwill not be proceeding\b"),
     _re.compile(r"\bnot be proceeding with your\b"),
     _re.compile(r"\bdecided to (?:progress|proceed|continue) with (?:other|another) candidates?\b"),
+    _re.compile(r"\bdecision to not move forward\b"),         # split-infinitive variant (Veeva, Lime)
+    _re.compile(r"\bdecided to move forward with candidates\b"),  # (Rho, Klaviyo)
+    _re.compile(r"\bwon't be proceeding with your\b"),        # (Rho)
+    _re.compile(r"\bnot selected for the next round\b"),      # (Spotify)
+    _re.compile(r"\bconcluding (?:our|the) search\b"),        # (Gemini)
+    _re.compile(r"\bfound a finalist\b"),                     # (Gemini)
 ]
 
 UPDATE_PHRASES = [
