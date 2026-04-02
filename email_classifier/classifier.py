@@ -61,11 +61,11 @@ def _apply_precedence(
             return "rejection", hits("rejection")
 
     # Rule 3 — INTERVIEW beats confirmation and update (not rejection/offer)
-    # Guard: requires interview_score >= confirmation_score * 0.75 when confirmation is present,
-    # so that weak interview signals (e.g. "next steps" / "move forward" in a boilerplate
-    # confirmation email) don't override a strong confirmation score.
+    # Guard: requires interview_score >= confirmation_score * 0.45 when confirmation is present.
+    # This lets genuine interview invitations win (ratio ~0.5) while blocking boilerplate
+    # confirmation phrases that mention "next steps" or "move forward" conditionally (ratio ~0.05–0.30).
     if has("interview"):
-        if not has("confirmation") or score("interview") >= score("confirmation") * 0.75:
+        if not has("confirmation") or score("interview") >= score("confirmation") * 0.45:
             return "interview", hits("interview")
 
     # Rule 4 — CONFIRMATION beats update only
