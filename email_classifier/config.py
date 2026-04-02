@@ -22,7 +22,7 @@ INTERVIEW_PHRASES = [
     ("phone screen", 8), ("technical assessment", 8), ("take-home assignment", 8),
     ("coding challenge", 8), ("virtual interview", 8), ("video interview", 8),
     ("on-site interview", 9), ("interview loop", 9), ("final round", 7),
-    ("schedule a call", 7), ("next steps", 5), ("take-home", 5),
+    ("schedule a call", 7), ("next steps", 2), ("take-home", 5),
     ("speak with you", 4), ("hiring manager", 4), ("interview", 4),
 ]
 

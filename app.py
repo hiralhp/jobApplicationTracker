@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from email.utils import parseaddr
 from urllib.parse import urlparse
 import pandas as pd
+import altair as alt
 
 from email_classifier import classify_email
 from email_classifier.config import ATS_DOMAINS
@@ -344,6 +345,7 @@ def init_db():
 
 
 
+@st.cache_data
 def get_companies():
     with get_conn() as conn:
         return conn.execute(
@@ -366,6 +368,7 @@ def add_company(name, last_applied=None, notes="", careers_url="", recruiting_em
             (name, last_applied, notes, careers_url, recruiting_email),
         )
         conn.commit()
+    get_companies.clear()
 
 
 def log_application(company_name, job_title, applied_date, email_subject="", gmail_msg_id=None):
@@ -396,6 +399,7 @@ def log_application(company_name, job_title, applied_date, email_subject="", gma
                  norm_company, norm_title, applied_date, gmail_msg_id),
             )
             conn.commit()
+            _load_stats_data.clear()
 
 
 def update_application_decision(company_name, decision_type, decision_date,
@@ -441,6 +445,7 @@ def update_application_decision(company_name, decision_type, decision_date,
             params,
         )
         conn.commit()
+    _load_stats_data.clear()
 
 
 def mark_scraped(company_id):
@@ -450,6 +455,7 @@ def mark_scraped(company_id):
             (date.today().isoformat(), company_id),
         )
         conn.commit()
+    get_companies.clear()
 
 
 
@@ -465,6 +471,8 @@ def mark_all_company_applied(company_name):
             (today, company_name),
         )
         conn.commit()
+    get_companies.clear()
+    get_postings.clear()
 
 
 def update_company(company_id, notes, careers_url, recruiting_email=""):
@@ -474,12 +482,41 @@ def update_company(company_id, notes, careers_url, recruiting_email=""):
             (notes, careers_url, recruiting_email, company_id),
         )
         conn.commit()
+    get_companies.clear()
 
 
 def delete_company(company_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM companies WHERE id = ?", (company_id,))
         conn.commit()
+    get_companies.clear()
+
+
+def delete_latest_application(company_id, company_name):
+    """Delete only the most recent applications entry for this company.
+
+    Keeps the company row in the tracker; updates last_applied to the new
+    most-recent applied_date (or NULL if no entries remain).
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM applications WHERE LOWER(company_name)=LOWER(?)"
+            " ORDER BY id DESC LIMIT 1",
+            (company_name,),
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM applications WHERE id = ?", (row[0],))
+        new_latest = conn.execute(
+            "SELECT MAX(applied_date) FROM applications WHERE LOWER(company_name)=LOWER(?)",
+            (company_name,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE companies SET last_applied = ? WHERE id = ?",
+            (new_latest, company_id),
+        )
+        conn.commit()
+    get_companies.clear()
+    _load_stats_data.clear()
 
 
 # ── Gmail constants ───────────────────────────────────────────────────────────
@@ -499,6 +536,12 @@ _GMAIL_SUBJECT_TERMS = [
     'subject:("application received")',
     'subject:("application confirmation")',
     'subject:("we received your application")',
+    # Additional patterns for non-ATS senders (DoorDash, Amazon, etc.)
+    'subject:("your application has been received")',
+    'subject:("application has been received")',
+    'subject:("application submitted")',
+    'subject:("successfully applied")',
+    'subject:("we\'ve received your application")',
 ]
 
 _STATUS_RANK = {"To Do": 0, "In Progress": 1, "Applied": 2, "Interviewing": 3, "Offer": 4}
@@ -693,22 +736,45 @@ def _match_company(sender, subject, companies, body=""):
             pre = subject[:m.start()]
             if re.search(r'[A-Z][A-Za-z]+\s+(?:the\s+|a\s+|an\s+|of\s+|&\s+)?$', pre):
                 continue
+            # Skip if followed by a word that signals a multi-word company name (e.g. "Listen Labs")
+            post = subject[m.end():m.end() + 20]
+            wm = re.match(r'\s+([A-Z][a-z]+)', post)
+            if wm and wm.group(1).lower() in _COMPANY_NAME_INDICATORS:
+                continue
         return row[1]
 
     # For ATS senders: match local part of email address against company slug first
     # e.g. zillow@myworkday.com → "zillow" → matches "Zillow" before body scan finds "Workday"
+    # Strip sub-addressing tag first (e.g. "githubinc+autoreply" → "githubinc" for iCIMS)
     if is_ats and "@" in addr_l:
-        local = addr_l.split("@")[0]
+        local = addr_l.split("@")[0].split("+")[0]
         if local:
             for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
                 slug = row[1].lower().replace(" ", "").replace("-", "")
-                if local == slug:
+                # Exact match, slug embedded in local (e.g. "github" ⊆ "githubinc"),
+                # or local embedded in slug (e.g. "univision" ⊆ "televisaunivision")
+                if (local == slug
+                        or (len(slug) >= 5 and slug in local)
+                        or (len(local) >= 5 and local in slug)):
                     return row[1]
 
     # For ATS senders: fall back to searching company name in email body (case-sensitive, longest first)
     if is_ats and body:
         for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
-            if re.search(r'\b' + re.escape(row[1]) + r'\b', body):
+            for m in re.finditer(r'\b' + re.escape(row[1]) + r'\b', body):
+                # Skip social-media-link context e.g. "Flexport on LinkedIn", "apply via Indeed"
+                ctx = body[max(0, m.start() - 15):m.start()]
+                if re.search(r'\bon\s+$|\bvia\s+$', ctx, re.IGNORECASE):
+                    continue
+                # Skip possessive reference e.g. "Microsoft's infrastructure" (not the hiring co.)
+                if m.end() < len(body) and body[m.end()] in ("'", "\u2019"):
+                    continue
+                # Skip single-word names followed by a company-indicator word (e.g. "Listen Labs")
+                if len(row[1].split()) == 1:
+                    post = body[m.end():m.end() + 20]
+                    wm = re.match(r'\s+([A-Z][a-z]+)', post)
+                    if wm and wm.group(1).lower() in _COMPANY_NAME_INDICATORS:
+                        continue
                 return row[1]
 
     # Sender domain → company name slug fallback (use second-to-last part, e.g. "anthropic" from "mail.anthropic.com")
@@ -723,6 +789,15 @@ def _match_company(sender, subject, companies, body=""):
 
 
 _SKIP_NAMES = {"our", "the", "a", "an", "your", "this", "that", "us", "we", "i", "you"}
+
+# Words that, when following a single-word company name, indicate the name is part of
+# a longer multi-word company (e.g. "Listen Labs", "Synapse Health", "Waymo Technologies").
+_COMPANY_NAME_INDICATORS = frozenset({
+    "labs", "lab", "technologies", "tech", "software", "systems",
+    "analytics", "health", "sciences", "networks", "digital",
+    "solutions", "studio", "studios", "media", "ai", "data",
+    "platform", "platforms", "robotics", "ventures", "institute",
+})
 
 _JOB_BOARD_DOMAINS = {
     "indeed.com", "linkedin.com", "glassdoor.com", "ziprecruiter.com",
@@ -751,15 +826,17 @@ _JOB_LEVEL_WORDS = {"senior", "junior", "staff", "principal", "sr", "jr", "entry
 # Ordered patterns: each captures the company name in group 1
 _COMPANY_SUBJECT_PATTERNS = [
     # "applying/applied/application to Company"
-    r"\bappl(?:ying|ied|ication)\s+to\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    r"\bappl(?:ying|ied|ication)\s+to\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "interest in working at/joining Company" — requires explicit prefix so job titles aren't caught
-    r"\binterest in\s+(?:working at |joining )([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    r"\binterest in\s+(?:working at |joining )([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "including Company in your job search" (iCIMS format)
     r"\bincluding\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s+in your\b",
-    # "at Company" — also allows "we/they" after name (e.g. "At StockX we believe")
-    r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |we |they |\-|[|!?,]|$))",
+    # "at Company" — stops at lowercase word (phrase), location ("in City"), or punctuation
+    r"\bat\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |we |they |\-|[|!?,]|$))",
     # "joining Company"
-    r"\bjoining\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s*(?:has been|is |are |\-|[|!?,]|$))",
+    r"\bjoining\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |\-|[|!?,]|$))",
+    # "by Team Company" — e.g. "Application received by Team Flexport!"
+    r"\bby\s+team\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "Company - Application…" at subject start
     r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received|thank you)",
     # "… | Company" at subject end
@@ -768,7 +845,7 @@ _COMPANY_SUBJECT_PATTERNS = [
 
 # Signature-line pattern handled separately (allows "The ..." company names)
 _TALENT_ACQUISITION_PAT = re.compile(
-    r"^((?:The\s+)?[A-Z][A-Za-z0-9 &.,'\-]{1,60}?)\s+Talent\s+Acquisition\b"
+    r"^((?:The\s+)?[A-Z][A-Za-z0-9 &.,'\-]{1,60}?)\s+Talent\s+(?:Acquisition|Team)\b"
 )
 
 def _extract_company_from_subject(subject):
@@ -780,9 +857,12 @@ def _extract_company_from_subject(subject):
         if len(name) > 2:
             return name
     for pat in _COMPANY_SUBJECT_PATTERNS:
-        m = re.search(pat, subject)
+        m = re.search(pat, subject, re.IGNORECASE)
         if m:
             name = m.group(1).strip().rstrip(".,- ")
+            # Company name must still start with an uppercase letter
+            if not name or not name[0].isupper():
+                continue
             first = name.split()[0].lower()
             # Allow "The ProperNoun" (e.g. "The New York Times", "The Trade Desk")
             if first == "the" and len(name.split()) >= 2 and name.split()[1][0].isupper():
@@ -932,7 +1012,7 @@ def _should_update(current, new):
     return _STATUS_RANK.get(new, 0) > _STATUS_RANK.get(current, 0)
 
 
-def run_gmail_sync(days=90):
+def run_gmail_sync(days=3):
     """Fetch emails, find application confirmations. Returns log — does NOT write to DB."""
     try:
         svc = build("gmail", "v1", credentials=_get_gmail_credentials())
@@ -1136,6 +1216,7 @@ def apply_gmail_match(company, email_date):
             (email_date, company),
         )
         conn.commit()
+    get_companies.clear()
     for pid, co, _, _, _, status, _ in get_postings():
         if co.lower() == company.lower() and status in ("To Do", "In Progress"):
             update_posting_status(pid, "Applied")
@@ -1168,13 +1249,15 @@ def render_companies_tab():
     if search:
         companies = [r for r in companies if search.lower() in r[1].lower()]
 
-    # ── split into 3 groups ──
+    # ── split into 4 groups ──
     # r[7]=last_applied, r[2]=last_checked
-    applied_group = [r for r in companies if days_ago(r[7]) is not None and days_ago(r[7]) <= applied_max]
+    never_applied_group = [r for r in companies if r[7] is None]
+    never_applied_ids   = {r[0] for r in never_applied_group}
+    applied_group = [r for r in companies if r[0] not in never_applied_ids and days_ago(r[7]) is not None and days_ago(r[7]) <= applied_max]
     applied_ids   = {r[0] for r in applied_group}
-    checked_group = [r for r in companies if r[0] not in applied_ids and days_ago(r[2]) is not None and days_ago(r[2]) < checked_max]
+    checked_group = [r for r in companies if r[0] not in never_applied_ids and r[0] not in applied_ids and days_ago(r[2]) is not None and days_ago(r[2]) < checked_max]
     checked_ids   = {r[0] for r in checked_group}
-    action_group  = [r for r in companies if r[0] not in applied_ids and r[0] not in checked_ids]
+    action_group  = [r for r in companies if r[0] not in never_applied_ids and r[0] not in applied_ids and r[0] not in checked_ids]
 
     def render_header():
         hcols = st.columns(COLS)
@@ -1256,17 +1339,15 @@ def render_companies_tab():
             if c[5].button(link_btn_label, key=f"lnk_{cid}", help=link_btn_help):
                 st.session_state.editing_url_id   = cid if st.session_state.editing_url_id != cid else None
                 st.session_state.editing_email_id = None
-                st.rerun()
 
             email_btn_label = "✎" if recruiting_email else "✉"
             email_btn_help  = "Edit recruiting email" if recruiting_email else "Add recruiting email"
             if c[6].button(email_btn_label, key=f"eml_{cid}", help=email_btn_help):
                 st.session_state.editing_email_id = cid if st.session_state.editing_email_id != cid else None
                 st.session_state.editing_url_id   = None
-                st.rerun()
 
-            if c[7].button("🗑", key=f"del_{cid}", help="Delete"):
-                delete_company(cid)
+            if c[7].button("🗑", key=f"del_{cid}", help="Delete last application entry"):
+                delete_latest_application(cid, name)
                 st.rerun()
 
             c[8].markdown(note_html, unsafe_allow_html=True)
@@ -1281,10 +1362,8 @@ def render_companies_tab():
                 if ec2.button("Save", key=f"url_save_{cid}", type="primary"):
                     update_company(cid, notes or "", new_url.strip(), recruiting_email or "")
                     st.session_state.editing_url_id = None
-                    st.rerun()
                 if ec3.button("Cancel", key=f"url_cancel_{cid}"):
                     st.session_state.editing_url_id = None
-                    st.rerun()
 
             if st.session_state.editing_email_id == cid:
                 _, ec1, ec2, ec3 = st.columns([0.3, 4.5, 1.0, 1.0])
@@ -1296,21 +1375,23 @@ def render_companies_tab():
                 if ec2.button("Save", key=f"email_save_{cid}", type="primary"):
                     update_company(cid, notes or "", careers_url or "", new_email.strip())
                     st.session_state.editing_email_id = None
-                    st.rerun()
                 if ec3.button("Cancel", key=f"email_cancel_{cid}"):
                     st.session_state.editing_email_id = None
-                    st.rerun()
 
             st.markdown('<hr class="row-divider">', unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab_never, tab2, tab3 = st.tabs([
         f"Need Action  ({len(action_group)})",
+        f"Never Applied  ({len(never_applied_group)})",
         f"Applied  ({len(applied_group)})",
         f"Checked  ({len(checked_group)})",
     ])
     with tab1:
         render_header()
         render_rows(action_group, empty_msg="✓ All caught up!")
+    with tab_never:
+        render_header()
+        render_rows(never_applied_group, empty_msg="No companies without applications.")
     with tab2:
         render_header()
         render_rows(applied_group, empty_msg="No recent applications.")
@@ -1398,7 +1479,7 @@ def render_gmail_tab():
 
     # ── Controls ──
     c1, c2, c3 = st.columns([1.3, 1.0, 1])
-    sync_days = c3.number_input("Days to scan", min_value=1, value=90, step=1, key="gmail_days")
+    sync_days = c3.number_input("Days to scan", min_value=1, value=3, step=1, key="gmail_days")
     if c1.button("🔄  Sync Gmail", type="primary"):
         with st.spinner("Syncing…  (a browser window may open for first-time authorization)"):
             log = run_gmail_sync(days=sync_days)
@@ -1857,6 +1938,7 @@ STATUS_STYLE = {
     "Rejected":     ("bg", "#fef2f2", "#dc2626"),
 }
 
+@st.cache_data
 def get_postings():
     with get_conn() as conn:
         return conn.execute(
@@ -1871,12 +1953,14 @@ def add_posting(company, role, url, date_added, notes=""):
             (company, role, url, date_added, notes),
         )
         conn.commit()
+    get_postings.clear()
 
 
 def update_posting_status(posting_id, status):
     with get_conn() as conn:
         conn.execute("UPDATE job_postings SET status = ? WHERE id = ?", (status, posting_id))
         conn.commit()
+    get_postings.clear()
 
 
 def sync_company_date(company_name):
@@ -1888,6 +1972,7 @@ def sync_company_date(company_name):
             (today, company_name),
         )
         conn.commit()
+    get_companies.clear()
 
 
 def mark_posting_applied(posting_id, company_name):
@@ -1899,12 +1984,14 @@ def mark_posting_applied(posting_id, company_name):
             (today, company_name),
         )
         conn.commit()
+    get_companies.clear()
 
 
 def delete_posting(posting_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM job_postings WHERE id = ?", (posting_id,))
         conn.commit()
+    get_postings.clear()
 
 
 # ── Jobs Tab UI ───────────────────────────────────────────────────────────────
@@ -1987,14 +2074,19 @@ def render_jobs_tab():
         st.markdown('<hr class="row-divider">', unsafe_allow_html=True)
 
 
-def render_stats_tab():
-    st.subheader("Application Stats")
-
+@st.cache_data(ttl=300)
+def _load_stats_data():
     with get_conn() as conn:
-        apps_raw = conn.execute(
+        return conn.execute(
             "SELECT company_name, job_title, applied_date, rejected_at "
             "FROM applications WHERE applied_date IS NOT NULL ORDER BY applied_date DESC"
         ).fetchall()
+
+
+def render_stats_tab():
+    st.subheader("Application Stats")
+
+    apps_raw = _load_stats_data()
 
     if not apps_raw:
         st.info("No data yet — run Gmail Sync on tracked companies to populate this tab.")
@@ -2038,7 +2130,7 @@ def render_stats_tab():
     if not df12.empty:
         st.markdown("**Last 12 weeks**")
         df12["week"] = df12["applied_date"].dt.to_period("W").apply(lambda p: p.start_time)
-        weekly_apps = df12.groupby("week").size().rename("Applications")
+        weekly_apps = df12.groupby("week").size().rename("Applied")
 
         # Rejections bucketed by rejection date (not applied date)
         rej12 = rej_df[rej_df["rejected_at"] >= (today - pd.Timedelta(weeks=12))].copy()
@@ -2049,7 +2141,39 @@ def render_stats_tab():
             weekly_rej = pd.Series(dtype=int, name="Rejections")
 
         weekly = pd.concat([weekly_apps, weekly_rej], axis=1).fillna(0).astype(int)
-        st.bar_chart(weekly)
+
+        # Fill all 12 weeks so the chart always shows a full grid
+        this_monday = today - pd.Timedelta(days=today.weekday())
+        all_mondays = pd.date_range(end=this_monday, periods=12, freq="W-MON")
+        weekly = weekly.reindex(all_mondays, fill_value=0)
+
+        # Build long-format DataFrame with m/d labels in chronological order
+        weekly_reset = weekly.reset_index().rename(columns={"index": "week"})
+        weekly_reset["label"] = weekly_reset["week"].apply(lambda d: f"{d.month}/{d.day}")
+        label_order = weekly_reset["label"].tolist()
+
+        weekly_long = weekly_reset.melt(id_vars=["week", "label"],
+                                        var_name="Type", value_name="Count")
+
+        chart = (
+            alt.Chart(weekly_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("label:N", title=None, sort=label_order,
+                         axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("Type:N",
+                                    scale=alt.Scale(domain=["Applied", "Rejections"])),
+                y=alt.Y("Count:Q", title="Count", axis=alt.Axis(tickMinStep=1)),
+                color=alt.Color(
+                    "Type:N",
+                    scale=alt.Scale(domain=["Applied", "Rejections"],
+                                    range=["#3b82f6", "#ef4444"]),
+                    legend=alt.Legend(orient="top", title=None),
+                ),
+            )
+            .properties(height=250)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
     st.markdown("")
 
@@ -2118,7 +2242,7 @@ def render_rejections_tab():
 
     # ── Controls ──
     c1, c2, c3 = st.columns([1.3, 1.0, 1])
-    sync_days = c3.number_input("Days to scan", min_value=1, value=90, step=1, key="rej_days")
+    sync_days = c3.number_input("Days to scan", min_value=1, value=3, step=1, key="rej_days")
     if c1.button("🔄  Sync Gmail", type="primary", key="rej_sync_btn"):
         with st.spinner("Syncing…  (a browser window may open for first-time authorization)"):
             log = run_gmail_sync(days=sync_days)

@@ -571,3 +571,83 @@ def test_45_regression_televisaunivision_no_longer_accepting_candidates():
     assert result.label == "rejection", (
         f"Expected rejection, got {result.label!r}. score_breakdown={result.score_breakdown}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: "next steps" in informational context must not trigger interview
+# ---------------------------------------------------------------------------
+
+def test_46_regression_zip_next_steps_in_confirmation_not_interview():
+    """Confirmation email mentioning 'next steps' informally (Zip/Ashby) must stay confirmation.
+
+    Root cause: 'next steps' weight=5 exceeded MIN_SCORE_THRESHOLD=3.0 alone, causing
+    interview to beat confirmation via Rule 3. Fix: lower 'next steps' to weight 2.
+    """
+    result = classify_email(
+        subject="Thanks for applying to Zip",
+        body=(
+            "Hi Hiral,\n\nThanks for your interest and for applying to our Product Manager, "
+            "Intake and Collaboration position! Your application has been received and will be "
+            "reviewed by our team.\n\nIf you are a top candidate for the role, you will receive "
+            "a message regarding next steps. If you are not selected, please continue to view "
+            "our careers page for roles that may be a better match in the future.\n\n"
+            "We realize it takes time and effort to apply and we appreciate your time.\n\n"
+            "Regards,\nZip"
+        ),
+        sender="no-reply@ashbyhq.com",
+    )
+    assert result.label == "confirmation", (
+        f"Expected confirmation, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_47_regression_doordash_next_steps_in_confirmation_not_interview():
+    """DoorDash confirmation email with 'coordinate next steps' must not classify as interview."""
+    result = classify_email(
+        subject="Thank you for applying to DoorDash",
+        body=(
+            "Hi Hiral,\n\nThank you for applying to DoorDash's Associate Manager, QA Strategy "
+            "& Operations position! We've received your application and will review it as soon "
+            "as possible! If your background looks like a good match, we'll reach out to "
+            "coordinate next steps.\n\nIn the meantime, feel free to download the DoorDash app."
+        ),
+        sender="no-reply@doordash.com",
+    )
+    assert result.label == "confirmation", (
+        f"Expected confirmation, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_48_regression_amazon_next_steps_in_confirmation_not_interview():
+    """Amazon confirmation email with 'discuss next steps' must not classify as interview."""
+    result = classify_email(
+        subject="Thanks for applying to Amazon",
+        body=(
+            "Hi HIRAL,\n\nThanks for applying to Amazon! We've received your application for "
+            "the Sr Product Manager, Tech - Ad Products, Prime Video Advertising (ID: 3204873) "
+            "position.\n\nWhat happens next? If we decide to move forward with your application, "
+            "the Amazon recruiting team will reach out to discuss next steps. Any updates to "
+            "your application status will be reflected on your Application dashboard.\n\n"
+            "Best regards,\nAmazon Recruiting Team"
+        ),
+        sender="amazon@myworkday.com",
+    )
+    assert result.label == "confirmation", (
+        f"Expected confirmation, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
+
+
+def test_49_next_steps_still_contributes_to_real_interview():
+    """'next steps' at weight 2 still boosts genuine interview emails with other signals."""
+    result = classify_email(
+        subject="Interview invitation — next steps",
+        body=(
+            "Hi Hiral,\n\nWe'd love to schedule an interview with you to discuss the role "
+            "and next steps. Please use the link below to book a time.\n\n"
+            "Looking forward to speaking with you!"
+        ),
+        sender="recruiting@acme.com",
+    )
+    assert result.label == "interview", (
+        f"Expected interview, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
