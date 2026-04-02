@@ -337,6 +337,16 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_app_company_norm  ON applications (company_normalized)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_app_latest_status ON applications (latest_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clf_app_id        ON email_classifications (application_id)")
+        # Q&A bank — company-specific and generic application answers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS company_qa (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                company    TEXT NOT NULL DEFAULT '',
+                question   TEXT NOT NULL,
+                answer     TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < 2:
             _backfill_v2(conn)
@@ -517,6 +527,43 @@ def delete_latest_application(company_id, company_name):
         conn.commit()
     get_companies.clear()
     _load_stats_data.clear()
+
+
+# ── Q&A bank ──────────────────────────────────────────────────────────────────
+
+@st.cache_data
+def get_qa():
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, company, question, answer FROM company_qa ORDER BY company, id"
+        ).fetchall()
+
+
+def add_qa(company, question, answer=""):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO company_qa (company, question, answer) VALUES (?, ?, ?)",
+            (company.strip(), question.strip(), answer.strip()),
+        )
+        conn.commit()
+    get_qa.clear()
+
+
+def update_qa(qa_id, answer):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE company_qa SET answer = ? WHERE id = ?",
+            (answer.strip(), qa_id),
+        )
+        conn.commit()
+    get_qa.clear()
+
+
+def delete_qa(qa_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM company_qa WHERE id = ?", (qa_id,))
+        conn.commit()
+    get_qa.clear()
 
 
 # ── Gmail constants ───────────────────────────────────────────────────────────
@@ -2454,6 +2501,126 @@ If you ever push code changes back to GitHub, these are already listed in `.giti
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def render_qa_tab():
+    st.subheader("Q&A Bank")
+    st.markdown(
+        '<p style="color:#6b7280;font-size:0.9rem;margin-bottom:1rem">'
+        "Store your answers to common application questions. Filter by company when preparing to apply."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if "qa_editing_id" not in st.session_state:
+        st.session_state.qa_editing_id = None
+
+    all_qa = get_qa()
+
+    # ── company filter ──
+    qa_companies = sorted({r[1] for r in all_qa if r[1]})
+    filter_options = ["All", "General"] + [c for c in qa_companies if c != "General"]
+    company_filter = st.selectbox(
+        "Company",
+        filter_options,
+        key="qa_filter",
+        label_visibility="collapsed",
+    )
+
+    # ── add form ──
+    with st.expander("➕  Add Question", expanded=not bool(all_qa)):
+        with st.form("qa_add_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            default_co = "" if company_filter == "All" else company_filter
+            company_input = c1.text_input(
+                "Company",
+                value=default_co,
+                placeholder="Figma  (blank = General)",
+                key="qa_new_co",
+            )
+            question_input = c2.text_input(
+                "Question *",
+                placeholder="Why do you want to work here?",
+                key="qa_new_q",
+            )
+            answer_input = st.text_area(
+                "Answer",
+                placeholder="Your answer…",
+                height=130,
+                key="qa_new_a",
+            )
+            if st.form_submit_button("Add Question", type="primary", use_container_width=True):
+                if question_input.strip():
+                    co = company_input.strip() if company_input.strip() else "General"
+                    add_qa(co, question_input.strip(), answer_input.strip())
+                    st.success(f"Added for **{co}**.")
+                    st.rerun()
+                else:
+                    st.error("Question is required.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── filtered list ──
+    if company_filter == "All":
+        filtered = all_qa
+    elif company_filter == "General":
+        filtered = [r for r in all_qa if not r[1] or r[1] == "General"]
+    else:
+        filtered = [r for r in all_qa if r[1] == company_filter]
+
+    if not filtered:
+        st.info("No questions yet for this filter — add one above.")
+        return
+
+    current_company = object()  # sentinel
+    for qa_id, company, question, answer in filtered:
+        # Section header when showing all
+        if company_filter == "All" and company != current_company:
+            current_company = company
+            st.markdown(
+                f'<p style="font-size:0.78rem;font-weight:700;color:#9ca3af;'
+                f'text-transform:uppercase;letter-spacing:0.07em;margin:12px 0 4px">'
+                f'{company or "General"}</p>',
+                unsafe_allow_html=True,
+            )
+
+        hcols = st.columns([7.5, 0.6, 0.6])
+        hcols[0].markdown(f"**{question}**")
+        if hcols[1].button("✎", key=f"qa_e_{qa_id}", help="Edit answer"):
+            st.session_state.qa_editing_id = (
+                qa_id if st.session_state.qa_editing_id != qa_id else None
+            )
+        if hcols[2].button("🗑", key=f"qa_d_{qa_id}", help="Delete question"):
+            delete_qa(qa_id)
+            if st.session_state.qa_editing_id == qa_id:
+                st.session_state.qa_editing_id = None
+            st.rerun()
+
+        if st.session_state.qa_editing_id == qa_id:
+            new_ans = st.text_area(
+                "answer",
+                value=answer or "",
+                key=f"qa_ta_{qa_id}",
+                height=160,
+                label_visibility="collapsed",
+            )
+            s1, s2, _ = st.columns([1, 1, 6])
+            if s1.button("Save", key=f"qa_sv_{qa_id}", type="primary"):
+                update_qa(qa_id, new_ans)
+                st.session_state.qa_editing_id = None
+            if s2.button("Cancel", key=f"qa_cn_{qa_id}"):
+                st.session_state.qa_editing_id = None
+        else:
+            if answer:
+                st.markdown(
+                    f'<div style="color:#374151;font-size:0.88rem;padding:4px 0 6px 10px;'
+                    f'border-left:3px solid #e5e7eb;white-space:pre-wrap">{answer}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("_No answer yet — click ✎ to add one_")
+
+        st.markdown('<hr class="row-divider">', unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(page_title="Job Application Tracker", layout="wide", page_icon="🔍")
     st.markdown(CSS, unsafe_allow_html=True)
@@ -2463,8 +2630,8 @@ def main():
     st.caption(f"Today · {date.today().strftime('%B %d, %Y')}")
     st.markdown("<br>", unsafe_allow_html=True)
 
-    tab_view, tab_add, tab_jobs, tab_stats, tab_gmail, tab_reject, tab_setup = st.tabs([
-        "📋  Companies", "➕  Add Company", "🎯  High-Effort Jobs", "📊  Stats",
+    tab_view, tab_add, tab_qa, tab_jobs, tab_stats, tab_gmail, tab_reject, tab_setup = st.tabs([
+        "📋  Companies", "➕  Add Company", "💬  Q&A", "🎯  High-Effort Jobs", "📊  Stats",
         "📧  Gmail Sync", "❌  Rejections", "⚙️  Gmail Setup",
     ])
 
@@ -2473,6 +2640,9 @@ def main():
 
     with tab_add:
         render_add_tab()
+
+    with tab_qa:
+        render_qa_tab()
 
     with tab_jobs:
         render_jobs_tab()
