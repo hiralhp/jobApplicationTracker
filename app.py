@@ -589,6 +589,8 @@ _GMAIL_SUBJECT_TERMS = [
     'subject:("application submitted")',
     'subject:("successfully applied")',
     'subject:("we\'ve received your application")',
+    'subject:("thank you for submitting")',
+    'subject:("thanks for submitting")',
 ]
 
 _STATUS_RANK = {"To Do": 0, "In Progress": 1, "Applied": 2, "Interviewing": 3, "Offer": 4}

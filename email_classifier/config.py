@@ -74,6 +74,13 @@ CONFIRMATION_PHRASES = [
     ("successfully submitted your application", 9),
     ("your application is under review", 7), ("we will review your application", 6),
     ("one of our recruiters will be in touch", 6),
+    # "submitting" variants (e.g. Airbyte/Ashby: "Thank you for submitting your application")
+    ("submitting your application", 9), ("for submitting your application", 9),
+    # "submission" as synonym for application (e.g. "we will review your submission")
+    ("review your submission", 6), ("we will review your submission", 6),
+    ("received your submission", 8), ("we received your submission", 8),
+    # "completing your application" (Airbyte: "time you invested in completing your application")
+    ("completing your application", 7),
     # deliberately weak — also appears in rejections (weight 2: below MIN_SCORE_THRESHOLD=3.0 alone):
     ("thank you for your interest", 2), ("thanks for your interest", 2),
 ]

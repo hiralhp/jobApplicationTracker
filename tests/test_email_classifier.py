@@ -651,3 +651,30 @@ def test_49_next_steps_still_contributes_to_real_interview():
     assert result.label == "interview", (
         f"Expected interview, got {result.label!r}. score_breakdown={result.score_breakdown}"
     )
+
+
+def test_50_regression_airbyte_submitting_phrasing():
+    """Ashby-style body using 'submitting your application' and 'review your submission'
+    must be classified as confirmation, not unknown.
+
+    Root cause: none of the body phrases matched — 'submitting' and 'submission'
+    are distinct from 'applying' and 'application' in exact-substring checks.
+    Fix: added ('submitting your application', 9), ('review your submission', 6),
+         ('completing your application', 7) to CONFIRMATION_PHRASES.
+    """
+    result = classify_email(
+        subject="Your application at Airbyte",
+        body=(
+            "Hi Hiral,\n\n"
+            "Thank you for submitting your application for the Senior Product Manager role at Airbyte. "
+            "We appreciate the time and effort you invested in completing your application and sharing "
+            "your background with us.\n\n"
+            "We will review your submission and aim to follow up within two weeks. "
+            "Thank you again for your interest in joining Airbyte.\n\n"
+            "Best,\nAirbyte Hiring Team"
+        ),
+        sender="no-reply@ashbyhq.com",
+    )
+    assert result.label == "confirmation", (
+        f"Expected confirmation, got {result.label!r}. score_breakdown={result.score_breakdown}"
+    )
