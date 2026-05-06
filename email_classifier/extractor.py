@@ -93,11 +93,15 @@ def extract_signals(subject: str, body: str, sender: str) -> EmailSignals:
     # Strip conditional/hypothetical negatives from body before scanning
     body_clean = re.sub(CONDITIONAL_STRIP_PATTERN, "", body_lower, flags=re.IGNORECASE)
 
-    offer_hits, offer_score = _scan(subject_lower, body_clean, OFFER_PHRASES)
-    interview_hits, interview_score = _scan(subject_lower, body_clean, INTERVIEW_PHRASES)
+    # For reply/forward threads the subject belongs to the original email, not the current
+    # message — suppress subject scoring to avoid stale signals boosting the wrong label.
+    scoring_subject = "" if re.match(r'^(?:re|fwd?)\s*:', subject_lower) else subject_lower
+
+    offer_hits, offer_score = _scan(scoring_subject, body_clean, OFFER_PHRASES)
+    interview_hits, interview_score = _scan(scoring_subject, body_clean, INTERVIEW_PHRASES)
 
     # Rejection: exact phrase scan + regex pattern scan (merged, deduped)
-    rejection_hits, rejection_score = _scan(subject_lower, body_clean, REJECTION_PHRASES)
+    rejection_hits, rejection_score = _scan(scoring_subject, body_clean, REJECTION_PHRASES)
     regex_hits, regex_score = _scan_regex(body_clean, REJECTION_PATTERNS)
     rejection_score += regex_score
     rejection_hits = list(dict.fromkeys(rejection_hits + regex_hits))
@@ -106,8 +110,8 @@ def extract_signals(subject: str, body: str, sender: str) -> EmailSignals:
     strong_rejection_hits = [m.group(0) for pat in STRONG_REJECTION_PATTERNS
                              if (m := pat.search(body_clean))]
 
-    confirmation_hits, confirmation_score = _scan(subject_lower, body_clean, CONFIRMATION_PHRASES)
-    update_hits, update_score = _scan(subject_lower, body_clean, UPDATE_PHRASES)
+    confirmation_hits, confirmation_score = _scan(scoring_subject, body_clean, CONFIRMATION_PHRASES)
+    update_hits, update_score = _scan(scoring_subject, body_clean, UPDATE_PHRASES)
 
     if is_ats_sender:
         confirmation_score *= ATS_CONFIRMATION_MULT

@@ -60,6 +60,27 @@ REJECTION_PHRASES = [
     ("not selected for the next round", 10),  # Spotify: "your resume was not selected for the next round"
     ("concluding our search", 9),             # Gemini: "are concluding our search at this time"
     ("found a finalist", 8),                  # Gemini: "found a finalist for this position"
+    # "position/role is no longer available" (Affirm)
+    ("position is no longer available", 10), ("role is no longer available", 10),
+    # "does not / doesn't fully align" (Scopely)
+    ("does not fully align", 7), ("doesn't fully align", 7),
+    # "no longer considering your" (Amplify)
+    ("no longer considering your", 10),
+    # "position is now filled" (Amplify)
+    ("position is now filled", 9),
+    # "has been filled" — catches "position you've applied for has been filled" (Reddit)
+    ("has been filled", 8),
+    # "regret to tell you" (TikTok — variant of "regret to inform you")
+    ("regret to tell you", 10),
+    # "not be progressing" variants (TikTok: "will not be progressing your application")
+    ("will not be progressing", 9), ("not be progressing your", 9),
+    # "credentials of other candidates" (Proofpoint)
+    ("credentials of other candidates", 10),
+    # "unable to find a good match" (Jane Street)
+    ("unable to find a good match", 9),
+    # "will not be advancing you" (NYT: "we will not be advancing you in the process")
+    ("will not be advancing", 10), ("not be advancing you", 10),
+    ("not advancing your application", 10),
 ]
 
 CONFIRMATION_PHRASES = [
@@ -93,7 +114,9 @@ CONFIRMATION_PHRASES = [
 REJECTION_PATTERNS: list = [
     # "no longer moving forward" variants (covers Adobe)
     (_re.compile(r"\bno longer moving forward\b"),                                        10),
-    (_re.compile(r"\bno longer (?:hiring|considering)(?: for)? this\b"),                   9),
+    (_re.compile(r"\bno longer (?:hiring|considering)\b"),                                 9),
+    # "no longer available" (Affirm: "position is no longer available")
+    (_re.compile(r"\bno longer available\b"),                                              9),
     # "progress / proceed / continue with other candidates" (covers Amazon)
     (_re.compile(r"\bprogress(?:ing)? with other candidates\b"),                          10),
     (_re.compile(r"\bproceeding with other candidates\b"),                                10),
@@ -117,6 +140,8 @@ REJECTION_PATTERNS: list = [
     (_re.compile(r"\bwon't be proceeding with your\b"),                                       9),
     # "no longer accepting candidates/applications/resumes" (TelevisaUnivision)
     (_re.compile(r"\bno longer accepting (?:candidates|applications|resumes)\b"),             7),
+    # "not (be) advancing you/your" (NYT: "we will not be advancing you in the process")
+    (_re.compile(r"\bnot (?:be )?advancing (?:you|your)\b"),                                 10),
 ]
 
 # Patterns unambiguous enough to override confirmation score entirely.
@@ -124,7 +149,8 @@ REJECTION_PATTERNS: list = [
 # Rule-2 ratio check (but offer still beats rejection).
 STRONG_REJECTION_PATTERNS: list = [
     _re.compile(r"\bno longer moving forward\b"),
-    _re.compile(r"\bno longer (?:hiring|considering)(?: for)? this\b"),
+    _re.compile(r"\bno longer (?:hiring|considering)\b"),
+    _re.compile(r"\bno longer available\b"),          # (Affirm)
     _re.compile(r"\bprogress(?:ing)? with other candidates\b"),
     _re.compile(r"\bproceeding with other candidates\b"),
     _re.compile(r"\bcontinuing? with other candidates\b"),
@@ -137,6 +163,10 @@ STRONG_REJECTION_PATTERNS: list = [
     _re.compile(r"\bnot selected for the next round\b"),      # (Spotify)
     _re.compile(r"\bconcluding (?:our|the) search\b"),        # (Gemini)
     _re.compile(r"\bfound a finalist\b"),                     # (Gemini)
+    _re.compile(r"\bcredentials of other candidates\b"),      # (Proofpoint)
+    _re.compile(r"\bunable to find a good match\b"),          # (Jane Street)
+    # "not (be) advancing you/your" (NYT)
+    _re.compile(r"\bnot (?:be )?advancing (?:you|your)\b"),
 ]
 
 UPDATE_PHRASES = [

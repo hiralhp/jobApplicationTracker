@@ -26,6 +26,7 @@ except ImportError:
 DB_PATH = "job_tracker.db"
 
 
+
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -224,6 +225,8 @@ def _backfill_v2(conn):
 
 def init_db():
     with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS companies (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -426,6 +429,13 @@ def update_application_decision(company_name, decision_type, decision_date,
             if len(open_apps) >= 2:
                 return  # ambiguous — don't guess
             application_id = open_apps[0][0]
+
+        # Sanity check: don't apply a decision dated before the application itself.
+        row = conn.execute(
+            "SELECT applied_date FROM applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        if row and row[0] and decision_date and decision_date < row[0]:
+            return
 
         set_clauses = [
             "decision_date = ?", "decision_type = ?",
@@ -811,9 +821,10 @@ def _match_company(sender, subject, companies, body=""):
     if is_ats and body:
         for row in sorted(companies, key=lambda r: len(r[1]), reverse=True):
             for m in re.finditer(r'\b' + re.escape(row[1]) + r'\b', body):
-                # Skip social-media-link context e.g. "Flexport on LinkedIn", "apply via Indeed"
+                # Skip social-media-link context e.g. "Flexport on LinkedIn", "apply via Indeed",
+                # or possessive context e.g. "Lyft's LinkedIn page"
                 ctx = body[max(0, m.start() - 15):m.start()]
-                if re.search(r'\bon\s+$|\bvia\s+$', ctx, re.IGNORECASE):
+                if re.search(r'\bon\s+$|\bvia\s+$|\b\w+\u2019s\s+$|\b\w+\'s\s+$', ctx, re.IGNORECASE):
                     continue
                 # Skip possessive reference e.g. "Microsoft's infrastructure" (not the hiring co.)
                 if m.end() < len(body) and body[m.end()] in ("'", "\u2019"):
@@ -823,6 +834,9 @@ def _match_company(sender, subject, companies, body=""):
                     post = body[m.end():m.end() + 20]
                     wm = re.match(r'\s+([A-Z][a-z]+)', post)
                     if wm and wm.group(1).lower() in _COMPANY_NAME_INDICATORS:
+                        continue
+                    # Skip phrasal-verb contexts e.g. "Check out", "Log in", "Sign up"
+                    if re.match(r'\s+(?:out|in|up|back)\b', post, re.IGNORECASE):
                         continue
                 return row[1]
 
@@ -837,7 +851,7 @@ def _match_company(sender, subject, companies, body=""):
     return None
 
 
-_SKIP_NAMES = {"our", "the", "a", "an", "your", "this", "that", "us", "we", "i", "you"}
+_SKIP_NAMES = {"our", "the", "a", "an", "your", "this", "that", "us", "we", "we've", "i", "you"}
 
 # Words that, when following a single-word company name, indicate the name is part of
 # a longer multi-word company (e.g. "Listen Labs", "Synapse Health", "Waymo Technologies").
@@ -887,7 +901,7 @@ _COMPANY_SUBJECT_PATTERNS = [
     # "by Team Company" — e.g. "Application received by Team Flexport!"
     r"\bby\s+team\s+([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)(?=\s+in\s+[A-Z]|\s+[a-z]|\s*(?:has been|is |are |\-|[|!?,]|$))",
     # "Company - Application…" at subject start
-    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we received|thank you)",
+    r"^([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*[-|]\s*(?:application|your application|we(?:'ve)? received|thank you)",
     # "… | Company" at subject end
     r"[|]\s*([A-Z][A-Za-z0-9 &.,'\-]{1,50}?)\s*$",
 ]
@@ -1092,6 +1106,32 @@ def run_gmail_sync(days=3):
     if not msgs:
         return [{"type": "info", "message": "No matching emails found."}]
 
+    # ── Batch-fetch all messages (100 per HTTP round-trip) ──
+    fetched: dict[str, dict] = {}
+
+    def _on_fetch(request_id, response, exception):
+        if exception is None:
+            fetched[request_id] = response
+
+    for i in range(0, len(msgs), 100):
+        chunk_refs = msgs[i : i + 100]
+        batch_req = svc.new_batch_http_request(callback=_on_fetch)
+        for ref in chunk_refs:
+            batch_req.add(
+                svc.users().messages().get(userId="me", id=ref["id"], format="full"),
+                request_id=ref["id"],
+            )
+        try:
+            batch_req.execute()
+        except Exception:
+            for ref in chunk_refs:  # fallback: individual fetches
+                try:
+                    fetched[ref["id"]] = svc.users().messages().get(
+                        userId="me", id=ref["id"], format="full"
+                    ).execute()
+                except Exception:
+                    pass
+
     tracked_names = {r[1].lower() for r in companies}
 
     # Gmail returns newest first — keep only the most recent email per company
@@ -1100,9 +1140,8 @@ def run_gmail_sync(days=3):
     best_rejections = {}   # company_lower → entry (tracked companies, rejections)
 
     for ref in msgs:
-        try:
-            msg = svc.users().messages().get(userId="me", id=ref["id"], format="full").execute()
-        except Exception:
+        msg = fetched.get(ref["id"])
+        if not msg:
             continue
         hdrs    = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
         subject = hdrs.get("Subject", "")
@@ -1252,9 +1291,14 @@ def run_gmail_sync(days=3):
 
 def mark_company_rejected(company):
     """Set matching job postings to Rejected."""
-    for pid, co, _, _, _, status, _ in get_postings():
-        if co.lower() == company.lower() and status != "Rejected":
-            update_posting_status(pid, "Rejected")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE job_postings SET status = 'Rejected'"
+            " WHERE LOWER(company) = LOWER(?) AND status != 'Rejected'",
+            (company,),
+        )
+        conn.commit()
+    get_postings.clear()
 
 
 def apply_gmail_match(company, email_date):
@@ -1264,11 +1308,14 @@ def apply_gmail_match(company, email_date):
             "UPDATE companies SET last_applied = ? WHERE LOWER(name) = LOWER(?)",
             (email_date, company),
         )
+        conn.execute(
+            "UPDATE job_postings SET status = 'Applied'"
+            " WHERE LOWER(company) = LOWER(?) AND status IN ('To Do', 'In Progress')",
+            (company,),
+        )
         conn.commit()
     get_companies.clear()
-    for pid, co, _, _, _, status, _ in get_postings():
-        if co.lower() == company.lower() and status in ("To Do", "In Progress"):
-            update_posting_status(pid, "Applied")
+    get_postings.clear()
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1277,6 +1324,7 @@ COLS    = [2.0, 1.6, 0.9, 1.5, 2.4, 0.55, 0.55, 0.55, 2.8]
 HEADERS = ["Company", "Activity", "Age", "Careers", "Action", "", "", "", "Notes"]
 
 
+@st.fragment
 def render_companies_tab():
     if "editing_url_id" not in st.session_state:
         st.session_state.editing_url_id = None
@@ -1299,12 +1347,13 @@ def render_companies_tab():
         companies = [r for r in companies if search.lower() in r[1].lower()]
 
     # ── split into 4 groups ──
-    # r[7]=last_applied, r[2]=last_checked
+    # r[7]=last_applied, r[2]=last_checked; pre-compute days_ago once per company
+    _da = {r[0]: (days_ago(r[7]), days_ago(r[2])) for r in companies}
     never_applied_group = [r for r in companies if r[7] is None]
     never_applied_ids   = {r[0] for r in never_applied_group}
-    applied_group = [r for r in companies if r[0] not in never_applied_ids and days_ago(r[7]) is not None and days_ago(r[7]) <= applied_max]
+    applied_group = [r for r in companies if r[0] not in never_applied_ids and _da[r[0]][0] is not None and _da[r[0]][0] <= applied_max]
     applied_ids   = {r[0] for r in applied_group}
-    checked_group = [r for r in companies if r[0] not in never_applied_ids and r[0] not in applied_ids and days_ago(r[2]) is not None and days_ago(r[2]) < checked_max]
+    checked_group = [r for r in companies if r[0] not in never_applied_ids and r[0] not in applied_ids and _da[r[0]][1] is not None and _da[r[0]][1] < checked_max]
     checked_ids   = {r[0] for r in checked_group}
     action_group  = [r for r in companies if r[0] not in never_applied_ids and r[0] not in applied_ids and r[0] not in checked_ids]
 
@@ -1318,11 +1367,17 @@ def render_companies_tab():
             )
         st.markdown('<hr style="border:none;border-top:1.5px solid #e5e7eb;margin:4px 0 6px">', unsafe_allow_html=True)
 
-    def render_rows(group, empty_msg="No companies here."):
+    _CO_PAGE_SIZE = 30
+
+    def render_rows(group, empty_msg="No companies here.", page_key="co_page"):
         if not group:
             st.markdown(f'<div style="padding:1.5rem 0;text-align:center;color:#9ca3af;font-size:0.9rem">{empty_msg}</div>', unsafe_allow_html=True)
             return
-        for cid, name, last_checked, _, notes, careers_url, recruiting_email, last_applied in group:
+        total = len(group)
+        n_pages = max(1, (total + _CO_PAGE_SIZE - 1) // _CO_PAGE_SIZE)
+        page = min(st.session_state.get(page_key, 0), n_pages - 1)
+        page_group = group[page * _CO_PAGE_SIZE : (page + 1) * _CO_PAGE_SIZE]
+        for cid, name, last_checked, _, notes, careers_url, recruiting_email, last_applied in page_group:
             # Age badge = most recent activity (applied or checked)
             most_recent = last_applied if (last_checked is None or (last_applied and last_applied > last_checked)) else last_checked
             d     = days_ago(most_recent)
@@ -1429,6 +1484,20 @@ def render_companies_tab():
 
             st.markdown('<hr class="row-divider">', unsafe_allow_html=True)
 
+        if n_pages > 1:
+            pc = st.columns([1, 4, 1])
+            if page > 0 and pc[0].button("← Prev", key=f"{page_key}_prev"):
+                st.session_state[page_key] = page - 1
+                st.rerun()
+            pc[1].markdown(
+                f'<div style="text-align:center;color:#9ca3af;font-size:0.82rem;padding-top:6px">'
+                f'Page {page + 1} of {n_pages} &nbsp;·&nbsp; {total} companies</div>',
+                unsafe_allow_html=True,
+            )
+            if page < n_pages - 1 and pc[2].button("Next →", key=f"{page_key}_next"):
+                st.session_state[page_key] = page + 1
+                st.rerun()
+
     tab1, tab_never, tab2, tab3 = st.tabs([
         f"Need Action  ({len(action_group)})",
         f"Never Applied  ({len(never_applied_group)})",
@@ -1437,16 +1506,16 @@ def render_companies_tab():
     ])
     with tab1:
         render_header()
-        render_rows(action_group, empty_msg="✓ All caught up!")
+        render_rows(action_group, empty_msg="✓ All caught up!", page_key="co_page_action")
     with tab_never:
         render_header()
-        render_rows(never_applied_group, empty_msg="No companies without applications.")
+        render_rows(never_applied_group, empty_msg="No companies without applications.", page_key="co_page_never")
     with tab2:
         render_header()
-        render_rows(applied_group, empty_msg="No recent applications.")
+        render_rows(applied_group, empty_msg="No recent applications.", page_key="co_page_applied")
     with tab3:
         render_header()
-        render_rows(checked_group, empty_msg="No recent checks.")
+        render_rows(checked_group, empty_msg="No recent checks.", page_key="co_page_checked")
 
     # ── edit expander (bulk notes) ──
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1496,6 +1565,7 @@ def render_add_tab():
 
 # ── Gmail Tab UI ──────────────────────────────────────────────────────────────
 
+@st.fragment
 def render_gmail_tab():
     st.subheader("Gmail Sync")
     st.markdown(
@@ -1591,7 +1661,7 @@ def render_gmail_tab():
         elif msg_id:
             trash_gmail_message(msg_id)
 
-    def _render_item(i, e, key_prefix, already_uptodate=False, show_checkbox=False):
+    def _render_item(i, e, key_prefix, already_uptodate=False, show_checkbox=False, inside_expander=False):
         current_age = _most_recent_age(e)
         new_age     = e.get("new_age")
         age_html    = f'{_age_badge(current_age)} → {_age_badge(new_age)}'
@@ -1634,6 +1704,24 @@ def render_gmail_tab():
             )
         else:
             use_cb = show_checkbox and not already_uptodate
+            # When an item is checked, skip per-row buttons — user will use bulk action.
+            # This cuts widget count from ~8 to ~3 per selected row.
+            is_sel = use_cb and st.session_state.get(f"chg_sel_{i}", False)
+            if is_sel:
+                row = st.columns([0.35, 6.65])
+                row[0].checkbox("", key=f"chg_sel_{i}", label_visibility="collapsed")
+                row[1].markdown(
+                    f'<span class="company-name">{e["company"]}</span>'
+                    f'&nbsp;{age_html}'
+                    f'<br><span style="color:#9ca3af;font-size:0.78rem">{e["subject"]}</span>'
+                    f'<br>{sender_html}',
+                    unsafe_allow_html=True,
+                )
+                body_text = (e.get("body") or "").strip()
+                if body_text:
+                    with st.expander("View email body"):
+                        st.text(body_text)
+                return
             if already_uptodate:
                 row = st.columns([3.5, 1.0, 0.9, 1.3, 0.8])
             elif use_cb:
@@ -1721,8 +1809,12 @@ def render_gmail_tab():
                     st.rerun()
         body_text = (e.get("body") or "").strip()
         if body_text:
-            with st.expander("View email body"):
-                st.text(body_text)
+            if inside_expander:
+                with st.popover("View email body"):
+                    st.text(body_text)
+            else:
+                with st.expander("View email body"):
+                    st.text(body_text)
 
     pending_items = [e for e in items if e["type"] == "pending"]
     new_items     = [e for e in items if e["type"] == "new"]
@@ -1902,6 +1994,17 @@ def render_gmail_tab():
                     st.session_state["gmail_updated"] = updated
                     st.session_state["gmail_undo"]    = undo_data
                     st.rerun()
+            elif st.session_state.get(f"new_sel_{i}", False):
+                # Compact mode when selected — skip per-row buttons, use bulk action
+                row = st.columns([0.35, 6.65])
+                row[0].checkbox("", key=f"new_sel_{i}", label_visibility="collapsed")
+                row[1].markdown(
+                    f'<span class="company-name">{e["company"]}</span>'
+                    f'&nbsp;{age_badge}'
+                    f'<br><span style="color:#9ca3af;font-size:0.78rem">{e["subject"]}</span>'
+                    f'<br>{sender_html}',
+                    unsafe_allow_html=True,
+                )
             else:
                 row = st.columns([0.35, 2.65, 1.4, 1.3, 0.9, 0.85])
                 row[0].checkbox("", key=f"new_sel_{i}", label_visibility="collapsed")
@@ -1971,7 +2074,7 @@ def render_gmail_tab():
                     st.session_state["gmail_dismissed"] = dismissed
                     st.rerun()
             for i, e in same:
-                _render_item(i, e, "same", already_uptodate=True)
+                _render_item(i, e, "same", already_uptodate=True, inside_expander=True)
 
 
 # ── Job Postings DB ───────────────────────────────────────────────────────────
@@ -2049,6 +2152,7 @@ JCOLS    = [1.6, 2.0, 1.1, 1.6, 1.4, 2.2, 1.5, 0.6]
 JHEADERS = ["Company", "Role", "Added", "Status", "Link", "Notes", "", ""]
 
 
+@st.fragment
 def render_jobs_tab():
     postings = get_postings()
 
@@ -2174,42 +2278,54 @@ def render_stats_tab():
 
     st.markdown("---")
 
-    # ── Weekly chart: applications + rejections (last 12 weeks) ──
-    df12 = df[df["days_ago"] <= 84].copy()
-    if not df12.empty:
-        st.markdown("**Last 12 weeks**")
-        df12["week"] = df12["applied_date"].dt.to_period("W").apply(lambda p: p.start_time)
-        weekly_apps = df12.groupby("week").size().rename("Applied")
+    # ── Chart: applications + rejections with selectable window ──
+    _WINDOWS = {"Last 14 days": 14, "Last 30 days": 30, "Last 12 weeks": 84}
+    window_label = st.radio(
+        "Window", list(_WINDOWS.keys()), horizontal=True, key="stats_window"
+    )
+    window_days  = _WINDOWS[window_label]
+    use_weekly   = window_label == "Last 12 weeks"
 
-        # Rejections bucketed by rejection date (not applied date)
-        rej12 = rej_df[rej_df["rejected_at"] >= (today - pd.Timedelta(weeks=12))].copy()
-        if not rej12.empty:
-            rej12["week"] = rej12["rejected_at"].dt.to_period("W").apply(lambda p: p.start_time)
-            weekly_rej = rej12.groupby("week").size().rename("Rejections")
+    df_win = df[df["days_ago"] <= window_days].copy()
+    if not df_win.empty:
+        rej_win = rej_df[rej_df["rejected_at"] >= (today - pd.Timedelta(days=window_days))].copy()
+
+        if use_weekly:
+            df_win["bucket"] = df_win["applied_date"].dt.to_period("W").apply(lambda p: p.start_time)
+            apps_grouped = df_win.groupby("bucket").size().rename("Applied")
+            if not rej_win.empty:
+                rej_win["bucket"] = rej_win["rejected_at"].dt.to_period("W").apply(lambda p: p.start_time)
+                rej_grouped = rej_win.groupby("bucket").size().rename("Rejections")
+            else:
+                rej_grouped = pd.Series(dtype=int, name="Rejections")
+            combined = pd.concat([apps_grouped, rej_grouped], axis=1).fillna(0).astype(int)
+            this_monday = today - pd.Timedelta(days=today.weekday())
+            all_buckets = pd.date_range(end=this_monday, periods=12, freq="W-MON")
         else:
-            weekly_rej = pd.Series(dtype=int, name="Rejections")
+            df_win["bucket"] = df_win["applied_date"].dt.normalize()
+            apps_grouped = df_win.groupby("bucket").size().rename("Applied")
+            if not rej_win.empty:
+                rej_win["bucket"] = rej_win["rejected_at"].dt.normalize()
+                rej_grouped = rej_win.groupby("bucket").size().rename("Rejections")
+            else:
+                rej_grouped = pd.Series(dtype=int, name="Rejections")
+            combined = pd.concat([apps_grouped, rej_grouped], axis=1).fillna(0).astype(int)
+            all_buckets = pd.date_range(end=today, periods=window_days, freq="D")
 
-        weekly = pd.concat([weekly_apps, weekly_rej], axis=1).fillna(0).astype(int)
-
-        # Fill all 12 weeks so the chart always shows a full grid
-        this_monday = today - pd.Timedelta(days=today.weekday())
-        all_mondays = pd.date_range(end=this_monday, periods=12, freq="W-MON")
-        weekly = weekly.reindex(all_mondays, fill_value=0)
-
-        # Build long-format DataFrame with m/d labels in chronological order
-        weekly_reset = weekly.reset_index().rename(columns={"index": "week"})
-        weekly_reset["label"] = weekly_reset["week"].apply(lambda d: f"{d.month}/{d.day}")
-        label_order = weekly_reset["label"].tolist()
-
-        weekly_long = weekly_reset.melt(id_vars=["week", "label"],
-                                        var_name="Type", value_name="Count")
+        combined = combined.reindex(all_buckets, fill_value=0)
+        combined_reset = combined.reset_index().rename(columns={"index": "bucket"})
+        combined_reset["label"] = combined_reset["bucket"].apply(lambda d: f"{d.month}/{d.day}")
+        label_order  = combined_reset["label"].tolist()
+        combined_long = combined_reset.melt(
+            id_vars=["bucket", "label"], var_name="Type", value_name="Count"
+        )
 
         chart = (
-            alt.Chart(weekly_long)
+            alt.Chart(combined_long)
             .mark_bar()
             .encode(
                 x=alt.X("label:N", title=None, sort=label_order,
-                         axis=alt.Axis(labelAngle=0)),
+                         axis=alt.Axis(labelAngle=0 if use_weekly else -45)),
                 xOffset=alt.XOffset("Type:N",
                                     scale=alt.Scale(domain=["Applied", "Rejections"])),
                 y=alt.Y("Count:Q", title="Count", axis=alt.Axis(tickMinStep=1)),
@@ -2252,6 +2368,19 @@ def render_stats_tab():
         bucket_counts = active_df["Bucket"].value_counts().reindex(bucket_order, fill_value=0)
         st.bar_chart(bucket_counts.rename("Active Applications"))
 
+    st.markdown("---")
+
+    # ── Applications table ──
+    st.markdown("**Applications log**")
+    tbl_df = df[df["job_title"].notna() & (df["job_title"].str.strip() != "")].copy()
+    if tbl_df.empty:
+        st.info("No applications with a job title recorded yet.")
+    else:
+        tbl_df = tbl_df[["company", "job_title", "applied_date", "rejected_at"]].copy()
+        tbl_df["applied_date"] = tbl_df["applied_date"].dt.strftime("%Y-%m-%d").fillna("")
+        tbl_df["rejected_at"]  = tbl_df["rejected_at"].dt.strftime("%Y-%m-%d").fillna("")
+        tbl_df.columns = ["Company", "Job Title", "Date Applied", "Date Rejected"]
+        st.dataframe(tbl_df, use_container_width=True, hide_index=True)
 
 
 def _age_badge_html(d):
@@ -2271,6 +2400,7 @@ def _trash_email_entry(e):
         trash_gmail_message(msg_id)
 
 
+@st.fragment
 def render_rejections_tab():
     st.subheader("Rejection Sync")
     st.markdown(
@@ -2503,6 +2633,7 @@ If you ever push code changes back to GitHub, these are already listed in `.giti
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+@st.fragment
 def render_qa_tab():
     st.subheader("Q&A Bank")
     st.markdown(
